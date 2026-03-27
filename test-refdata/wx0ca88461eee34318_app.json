@@ -1,0 +1,27 @@
+{
+    "pages": [
+        "pages/home/home",
+        "pages/logs/logs",
+        "pages/personal/personal",
+        "pages/contractReview/contractReview",
+        "pages/contractReview/contractReviewCreate/contractReviewCreate",
+        "pages/contractReview/contractReviewDetail/contractReviewDetail",
+        "pages/contractReview/contractReviewExport/contractReviewExport",
+        "pages/netPage/netPage",
+        "pages/webShow/webShow",
+        "pages/history/history",
+        "pages/testCode/testCode",
+        "pages/preview/preview",
+        "pages/feedback/feedback",
+        "pages/userInfoCollection/userInfoCollection",
+        "pages/fullpageIntro/fullpageIntro",
+        "pages/transferPage/transferPage",
+        "pages/contractReview/uploadByApp/uploadByApp"
+    ],
+    "window": {
+        "navigationBarBackgroundColor": "#fff",
+        "backgroundColor": "#ffffff",
+        "navigationBarTextStyle": "black",
+        "navigationStyle": "custom"
+    }
+}

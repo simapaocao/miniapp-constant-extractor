@@ -1,0 +1,21 @@
+[is="components/arrow/arrow"] {
+    width: 100%;
+    z-index: 2;
+}
+
+[is="components/skuComponent/components/buttons/index"] {
+    height: 100%;
+    width: 100%;
+}
+
+[is="components/uiImage/index"] {
+    max-width: 100%;
+}
+
+[is="pages/shop/cart/image/index"] {
+    display: contents;
+}
+
+[is="pages/shop/cart/select/index"] {
+    display: contents;
+}
