@@ -1,0 +1,881 @@
+{
+  "version": "1.1",
+  "description": "Mini-app constant classification taxonomy for security sensitive information detection. Focuses on secrets, auth, payment, identifiers, PII, endpoints, cloud/storage, crypto config, and noise. Backwards compatible with earlier core groups (url/webhook_url/token/key/ip/path/other_singles).",
+  "attribute_defs": [
+    {
+      "key": "provider",
+      "description": "Provider/source system (wechat/tencent/aliyun/aws/stripe/etc.)",
+      "data_type": "string"
+    },
+    {
+      "key": "sensitivity",
+      "description": "Sensitivity level 1-4 (1=low, 4=very sensitive)",
+      "data_type": "integer"
+    },
+    {
+      "key": "action",
+      "description": "Policy action (allow|warn|redact|block|rotate_required)",
+      "data_type": "string"
+    },
+    {
+      "key": "scope",
+      "description": "Where it appears (frontend|backend|any)",
+      "data_type": "string"
+    },
+    {
+      "key": "note",
+      "description": "Human note",
+      "data_type": "string"
+    }
+  ],
+  "risk_scale": {
+    "desc": "Severity of risk level",
+    "start_index": 200,
+    "items": {
+      "ignore": "Ignore/noise",
+      "low": "Low",
+      "medium": "Medium",
+      "elevated": "Elevated (Investigation Required)",
+      "high": "High (Exploitable)",
+      "critical": "Critical (Immediate Breach)"
+    }
+  },
+  "policy_maps": {
+    "desc": "Supposed action to take",
+    "start_index": 300,
+    "risk_to_default_action": {
+      "allow": "allow",
+      "warn": "warn",
+      "redact": "redact",
+      "block": "block"
+    }
+  },
+  "token_types": {
+    "desc": "Token types used as Credentials, API-key, etc.",
+    "start_index": 500,
+    "items": {
+      "jwt": "jwt token",
+      "bearer": "Bearer token",
+      "basic": "Basic token",
+      "session_key": "WeChat/Alipay Session Key"
+    }
+  },
+  "datatype_categories": [
+    {
+      "category": "platform_credential",
+      "default_risk": 5,
+      "desc": "Credentials for platform APIs (e.g., WeChat/Alipay/TikTok)",
+      "start_index": 1100,
+      "default_attributes": {
+        "sensitivity": 4,
+        "action": "block",
+        "scope": "any"
+      },
+      "items": [
+        {
+          "slug": "platform_app_secret",
+          "risk": 5,
+          "desc": "AppSecret/ClientSecret. Allows full account takeover.",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block"
+          }
+        },
+        {
+          "slug": "platform_session_key",
+          "risk": 5,
+          "desc": "User Session Key. Used to decrypt PII (Phone/Bio). MUST NOT exist in frontend.",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block",
+            "note": "Critical Privacy Leak"
+          }
+        },
+        {
+          "slug": "platform_access_token",
+          "risk": 5,
+          "desc": "Backend-to-Platform Access Token.",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block"
+          }
+        }
+      ]
+    },
+    {
+      "category": "cloud_credential",
+      "default_risk": 5,
+      "desc": "Password and tokens for accessing third party services",
+      "start_index": 1200,
+      "default_attributes": {
+        "sensitivity": 4,
+        "action": "block",
+        "scope": "any"
+      },
+      "items": [
+        {
+          "slug": "cloud_cred_ak_sk_pair",
+          "risk": 5,
+          "desc": "AccessKey + SecretKey pair.",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block"
+          }
+        },
+        {
+          "slug": "cloud_cred_upload_policy_signed",
+          "risk": 4,
+          "desc": "Hardcoded Pre-signed Upload Policy (OSS/S3).",
+          "attributes": {
+            "sensitivity": 3,
+            "action": "redact",
+            "note": "Check for unrestricted write scope"
+          }
+        },
+        {
+          "slug": "cloud_cred_password",
+          "risk": 5,
+          "desc": "Password literal",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block"
+          }
+        },
+        {
+          "slug": "cloud_cred_basic_auth",
+          "risk": 5,
+          "desc": "Basic auth user:pass",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block"
+          }
+        },
+        {
+          "slug": "cloud_cred_token",
+          "risk": 5,
+          "desc": "Access tokens",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block"
+          }
+        },
+        {
+          "slug": "cloud_cred_cookie",
+          "risk": 4,
+          "desc": "Cookie string / Set-Cookie literal",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "redact"
+          }
+        },
+        {
+          "slug": "cloud_cred_noise",
+          "risk": 0,
+          "desc": "Credential-like noise",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        }
+      ]
+    },
+    {
+      "category": "cloud_storage",
+      "default_risk": 2,
+      "desc": "Storage location on third party servers",
+      "start_index": 1300,
+      "default_attributes": {
+        "sensitivity": 2,
+        "action": "warn",
+        "scope": "any"
+      },
+      "items": [
+        {
+          "slug": "cloud_bucket_name",
+          "risk": 2,
+          "desc": "Cloud bucket name",
+          "attributes": {
+            "sensitivity": 2,
+            "action": "warn",
+            "note": "Bucket names can expose infra structure"
+          }
+        },
+        {
+          "slug": "cloud_region",
+          "risk": 1,
+          "desc": "Cloud region (ap-shanghai, etc.)",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        },
+        {
+          "slug": "cloud_storage_path",
+          "risk": 2,
+          "desc": "Cloud storage object path (images/... mp4/png etc.)",
+          "attributes": {
+            "sensitivity": 2,
+            "action": "warn"
+          }
+        },
+        {
+          "slug": "cloud_upload_config",
+          "risk": 3,
+          "desc": "Cloud SDK upload configuration object (SimpleUploadMethod, etc.)",
+          "attributes": {
+            "sensitivity": 3,
+            "action": "warn"
+          }
+        },
+        {
+          "slug": "cloud_noise",
+          "risk": 0,
+          "desc": "Cloud noise",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        }
+      ]
+    },
+    {
+      "category": "saas_credential",
+      "default_risk": 2,
+      "desc": "API Keys for third-party SaaS (Maps, Analytics, Push)",
+      "start_index": 1400,
+      "items": [
+        {
+          "slug": "saas_map_key",
+          "risk": 2,
+          "desc": "Map SDK Key (Tencent Map/Amap/Google).",
+          "attributes": {
+            "sensitivity": 2,
+            "action": "warn",
+            "note": "Check referrer restrictions"
+          }
+        },
+        {
+          "slug": "saas_analytics_key",
+          "risk": 1,
+          "desc": "Analytics ID (Mixpanel/Sentry/Bugly).",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        }
+      ]
+    },
+    {
+      "category": "webhook_url",
+      "default_risk": 5,
+      "desc": "Webhook URLs for third-party integrations",
+      "start_index": 1500,
+      "default_attributes": {
+        "sensitivity": 4,
+        "action": "block",
+        "scope": "any"
+      },
+      "items": [
+        {
+          "slug": "webhook_url",
+          "risk": 5,
+          "desc": "Webhook URL",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block"
+          }
+        }
+      ]
+    },
+    {
+      "category": "server_credential",
+      "default_risk": 4,
+      "desc": "credentials for accessing backend server",
+      "start_index": 1600,
+      "default_attributes": {
+        "sensitivity": 4,
+        "action": "block",
+        "scope": "any"
+      },
+      "items": [
+        {
+          "slug": "server_cred_password",
+          "risk": 5,
+          "desc": "Username and password pairs for accessing the backend server",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block"
+          }
+        },
+        {
+          "slug": "server_cred_token",
+          "risk": 5,
+          "desc": "Token for accessing the backend server",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block"
+          }
+        },
+        {
+          "slug": "server_cred_session_key",
+          "risk": 5,
+          "desc": "Session key for accessing the backend server",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block"
+          }
+        },
+        {
+          "slug": "server_cred_cookie",
+          "risk": 5,
+          "desc": "Cookie for accessing the backend server",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block"
+          }
+        },
+        {
+          "slug": "server_cred_noise",
+          "risk": 0,
+          "desc": "Credential-like noise",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        }
+      ]
+    },
+    {
+      "category": "server_url",
+      "default_risk": 2,
+      "desc": "Backend/server URLs and endpoints",
+      "start_index": 1700,
+      "default_attributes": {
+        "sensitivity": 1,
+        "action": "warn",
+        "scope": "any"
+      },
+      "items": [
+        {
+          "slug": "server_url_with_credentials",
+          "risk": 5,
+          "desc": "URL with credentials",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block"
+          }
+        },
+        {
+          "slug": "server_url_auth",
+          "risk": 4,
+          "desc": "Auth/Login endpoint",
+          "attributes": {
+            "sensitivity": 3,
+            "action": "redact"
+          }
+        },
+        {
+          "slug": "server_url_payment",
+          "risk": 4,
+          "desc": "Payment endpoint",
+          "attributes": {
+            "sensitivity": 3,
+            "action": "redact"
+          }
+        },
+        {
+          "slug": "server_url_internal",
+          "risk": 3,
+          "desc": "Internal environment URL",
+          "attributes": {
+            "sensitivity": 2,
+            "action": "warn"
+          }
+        },
+        {
+          "slug": "server_url_api_plain",
+          "risk": 1,
+          "desc": "Plain API URL",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        },
+        {
+          "slug": "server_url_static",
+          "risk": 1,
+          "desc": "Static resource URL",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        },
+        {
+          "slug": "server_url_noise",
+          "risk": 0,
+          "desc": "URL noise",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        }
+      ]
+    },
+    {
+      "category": "backend_ip",
+      "default_risk": 2,
+      "desc": "IP addresses (public/private) that may expose infrastructure",
+      "start_index": 1800,
+      "default_attributes": {
+        "sensitivity": 1,
+        "action": "warn",
+        "scope": "any"
+      },
+      "items": [
+        {
+          "slug": "backend_ip_public",
+          "risk": 3,
+          "desc": "Public IP",
+          "attributes": {
+            "sensitivity": 2,
+            "action": "warn"
+          }
+        },
+        {
+          "slug": "backend_ip_private",
+          "risk": 2,
+          "desc": "Private IP",
+          "attributes": {
+            "sensitivity": 2,
+            "action": "warn"
+          }
+        },
+        {
+          "slug": "backend_ip_noise",
+          "risk": 0,
+          "desc": "IP noise",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        }
+      ]
+    },
+    {
+      "category": "miniapp_internal",
+      "default_risk": 1,
+      "desc": "Miniapp internal structure (pages, plugins, scene params)",
+      "start_index": 1900,
+      "default_attributes": {
+        "sensitivity": 1,
+        "action": "allow",
+        "scope": "any"
+      },
+      "items": [
+        {
+          "slug": "miniapp_page_path_sensitive",
+          "risk": 3,
+          "desc": "Sensitive Page Route (admin/test/debug/config/internal).",
+          "attributes": {
+            "sensitivity": 2,
+            "action": "warn",
+            "note": "Potential Shadow Entry Point"
+          }
+        },
+        {
+          "slug": "miniapp_page_path",
+          "risk": 1,
+          "desc": "Standard page route path.",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        },
+        {
+          "slug": "miniapp_plugin_url",
+          "risk": 2,
+          "desc": "Miniapp plugin URL (plugin:// / plugin-private://)",
+          "attributes": {
+            "sensitivity": 2,
+            "action": "warn"
+          }
+        },
+        {
+          "slug": "miniapp_scene_param",
+          "risk": 2,
+          "desc": "Scene parameter in path (/pages/...?...scene=...)",
+          "attributes": {
+            "sensitivity": 2,
+            "action": "warn",
+            "note": "scene often encodes identifiers"
+          }
+        },
+        {
+          "slug": "miniapp_path_asset",
+          "risk": 1,
+          "desc": "Asset path",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        },
+        {
+          "slug": "miniapp_path_module",
+          "risk": 1,
+          "desc": "Module require/import path",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        },
+        {
+          "slug": "miniapp_noise",
+          "risk": 0,
+          "desc": "Miniapp internal noise",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        }
+      ]
+    },
+    {
+      "category": "miniapp_api",
+      "default_risk": 1,
+      "desc": "Miniapp code paths with parameters for accessing backend.",
+      "start_index": 2000,
+      "default_attributes": {
+        "sensitivity": 1,
+        "action": "allow",
+        "scope": "any"
+      },
+      "items": [
+        {
+          "slug": "miniapp_api_params",
+          "risk": 1,
+          "desc": "API path with parameters",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "warn"
+          }
+        }
+      ]
+    },
+    {
+      "category": "crypto_config",
+      "default_risk": 2,
+      "desc": "crypto_configuration for accessing cloud and backend servers",
+      "start_index": 2100,
+      "default_attributes": {
+        "sensitivity": 2,
+        "action": "warn",
+        "scope": "any"
+      },
+      "items": [
+        {
+          "slug": "crypto_algorithm_name",
+          "risk": 1,
+          "desc": "Crypto algorithm name (MD5/SHA1/SHA256/AES/RSA/etc.)",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        },
+        {
+          "slug": "crypto_private_key",
+          "risk": 5,
+          "desc": "Private key PEM/PKCS",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block"
+          }
+        },
+        {
+          "slug": "crypto_public_key",
+          "risk": 2,
+          "desc": "Public key literal",
+          "attributes": {
+            "sensitivity": 2,
+            "action": "warn"
+          }
+        },
+        {
+          "slug": "crypto_static_iv",
+          "risk": 2,
+          "desc": "Hardcoded Initialization Vector (IV).",
+          "attributes": {
+            "sensitivity": 2,
+            "action": "warn",
+            "note": "Reduces encryption entropy"
+          }
+        },
+        {
+          "slug": "crypto_weak_algorithm",
+          "risk": 3,
+          "desc": "Usage of MD5/SHA1 for sensitive operations.",
+          "attributes": {
+            "sensitivity": 2,
+            "action": "warn"
+          }
+        },
+        {
+          "slug": "crypto_noise",
+          "risk": 0,
+          "desc": "Crypto noise",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        }
+      ]
+    },
+    {
+      "category": "data_encoding",
+      "default_risk": 0,
+      "desc": "data encoding scheme",
+      "start_index": 2200,
+      "default_attributes": {
+        "sensitivity": 1,
+        "action": "allow",
+        "scope": "any"
+      },
+      "items": [
+        {
+          "slug": "encoding_base64",
+          "risk": 0,
+          "desc": "Apply the base64 encoding",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        },
+        {
+          "slug": "encoding_url",
+          "risk": 0,
+          "desc": "Apply the URL encoding",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        },
+        {
+          "slug": "encoding_others",
+          "risk": 0,
+          "desc": "Other encoding schemes",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        }
+      ]
+    },
+    {
+      "category": "pii",
+      "default_risk": 4,
+      "desc": "Personal information",
+      "start_index": 2300,
+      "default_attributes": {
+        "sensitivity": 4,
+        "action": "redact",
+        "scope": "any"
+      },
+      "items": [
+        {
+          "slug": "pii_sfzid_name",
+          "risk": 5,
+          "desc": "Personal ID number with name",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block"
+          }
+        },
+        {
+          "slug": "pii_phone_name",
+          "risk": 4,
+          "desc": "Phone number with name",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "redact"
+          }
+        },
+        {
+          "slug": "pii_email_name",
+          "risk": 3,
+          "desc": "Email address with name",
+          "attributes": {
+            "sensitivity": 3,
+            "action": "redact"
+          }
+        },
+        {
+          "slug": "pii_noise",
+          "risk": 0,
+          "desc": "PII noise",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        }
+      ]
+    },
+    {
+      "category": "payment",
+      "default_risk": 3,
+      "desc": "Information for payment operation",
+      "start_index": 2400,
+      "default_attributes": {
+        "sensitivity": 3,
+        "action": "warn",
+        "scope": "any",
+        "provider": "payment"
+      },
+      "items": [
+        {
+          "slug": "payment_request_params",
+          "risk": 3,
+          "desc": "requestPayment parameter keys (timeStamp, nonceStr, package, paySign, signType)",
+          "attributes": {
+            "sensitivity": 3,
+            "action": "warn",
+            "provider": "wechat"
+          }
+        },
+        {
+          "slug": "payment_nonce",
+          "risk": 3,
+          "desc": "Payment nonceStr",
+          "attributes": {
+            "sensitivity": 3,
+            "action": "redact"
+          }
+        },
+        {
+          "slug": "payment_package",
+          "risk": 3,
+          "desc": "Payment package string (prepay_id=...)",
+          "attributes": {
+            "sensitivity": 3,
+            "action": "redact"
+          }
+        },
+        {
+          "slug": "payment_sign_type",
+          "risk": 1,
+          "desc": "Sign type (MD5/HMAC-SHA256/etc.)",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        },
+        {
+          "slug": "payment_pay_sign",
+          "risk": 4,
+          "desc": "paySign value / signature",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "redact"
+          }
+        },
+        {
+          "slug": "payment_secret",
+          "risk": 5,
+          "desc": "Payment secret keys (merchant key, platform key, signing key)",
+          "attributes": {
+            "sensitivity": 4,
+            "action": "block",
+            "provider": "payment"
+          }
+        },
+        {
+          "slug": "payment_noise",
+          "risk": 0,
+          "desc": "Payment noise/placeholder",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        }
+      ]
+    },
+    {
+      "category": "identifier",
+      "default_risk": 2,
+      "desc": "Identifiers (device/user/ad/order) relevant to privacy tracking",
+      "start_index": 2500,
+      "default_attributes": {
+        "sensitivity": 2,
+        "action": "warn",
+        "scope": "any"
+      },
+      "items": [
+        {
+          "slug": "id_device_identifier",
+          "risk": 3,
+          "desc": "Device identifiers (IDFA/IMEI/AndroidId/MAC/oaid)",
+          "attributes": {
+            "sensitivity": 3,
+            "action": "redact"
+          }
+        },
+        {
+          "slug": "id_ad_identifier",
+          "risk": 3,
+          "desc": "Advertising identifier / ad tracking id",
+          "attributes": {
+            "sensitivity": 3,
+            "action": "redact"
+          }
+        },
+        {
+          "slug": "id_user_identifier",
+          "risk": 3,
+          "desc": "User identifier (uid/userId/memberId/openid/unionid)",
+          "attributes": {
+            "sensitivity": 3,
+            "action": "redact"
+          }
+        },
+        {
+          "slug": "id_order_identifier",
+          "risk": 2,
+          "desc": "Order/transaction id",
+          "attributes": {
+            "sensitivity": 2,
+            "action": "warn"
+          }
+        },
+        {
+          "slug": "id_noise",
+          "risk": 0,
+          "desc": "Identifier noise",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        }
+      ]
+    },
+    {
+      "category": "others",
+      "default_risk": 1,
+      "desc": "Other unclassified but seems security sensitive data",
+      "start_index": 9900,
+      "default_attributes": {
+        "sensitivity": 1,
+        "action": "allow",
+        "scope": "any"
+      },
+      "items": [
+        {
+          "slug": "other",
+          "risk": 0,
+          "desc": "Unknow",
+          "attributes": {
+            "sensitivity": 1,
+            "action": "allow"
+          }
+        }
+      ]
+    }
+  ]
+}

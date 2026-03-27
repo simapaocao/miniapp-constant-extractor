@@ -1,0 +1,102 @@
+[
+  {
+    "slug": "cloud_ak_sk_pair",
+    "string": "AKIDFAKEEXAMPLEKEY0000000000000000",
+    "statement": "SecretId: \"AKIDFAKEEXAMPLEKEY0000000000000000\""
+  },
+  {
+    "slug": "cloud_ak_sk_pair",
+    "string": "SecretKey: \"hKsXDoCOMBvX0WwNirv5CBSlzMj3IkGi\"",
+    "statement": "SecretKey: \"hKsXDoCOMBvX0WwNirv5CBSlzMj3IkGi\""
+  },
+  {
+    "slug": "cloud_bucket_name",
+    "string": "Bucket: \"jun-1304312940\"",
+    "statement": "Bucket: \"jun-1304312940\""
+  },
+  {
+    "slug": "cloud_region",
+    "string": "Region: \"ap-shanghai\"",
+    "statement": "Region: \"ap-shanghai\""
+  },
+  {
+    "slug": "id_user_identifier",
+    "string": "wx.setStorageSync(\"openid\", s.data.data.openid)",
+    "statement": "success: function (s) {\n            if (\n              (wx.setStorageSync(\"openid\", s.data.data.openid),\n              wx.setStorageSync(\"ad\", s.data.data.ad),\n              i.setData({\n                ad: s.data.data.ad,\n              }),\n              t.joinid > 0)\n            )\n              var o = t.joinid;\n            else o = 0;\n            i.setData({\n              joinid: o,\n            }),\n              e.util.request({\n                url: \"entry/wxapp/Getjoin\",\n                data: {\n                  voteid: a,\n                  openid: s.data.data.openid,\n                  joinid: o,\n                },\n                success: function (t) {\n                  null != t.data.data.username &&\n                    ((i.data.list.username = t.data.data.username),\n                    (i.data.list.imgs = JSON.parse(t.data.data.image)),\n                    t.data.data.baoming &&\n                      (i.data.list.baoming = JSON.parse(t.data.data.baoming)),\n                    i.setData({\n                      check_state: t.data.data.check_state,\n                      joinid: t.data.data.id,\n                      list: i.data.list,\n                      siteInfosurl: e.siteInfo.surl,\n                    }),\n                    console.log(JSON.parse(t.data.data.baoming)));\n                },\n              });\n          }"
+  },
+  {
+    "slug": "payment_request_params",
+    "string": "wx.requestPayment({ timeStamp: t.data.timeStamp, nonceStr: t.data.nonceStr, package: t.data.package, signType: \"MD5\", paySign: t.data.paySign })",
+    "statement": "wx.requestPayment({ timeStamp: t.data.timeStamp, nonceStr: t.data.nonceStr, package: t.data.package, signType: \"MD5\", paySign: t.data.paySign })"
+  },
+  {
+    "slug": "payment_sign_type",
+    "string": "signType: \"MD5\"",
+    "statement": "signType: \"MD5\""
+  },
+  {
+    "slug": "payment_pay_sign",
+    "string": "paySign: \"9A1B2C3D4E5F...\"",
+    "statement": "paySign: \"9A1B2C3D4E5F...\""
+  },
+  {
+    "slug": "miniapp_page_path",
+    "string": "pages/userInfoCollection/userInfoCollection",
+    "statement": "pages/13: \"pages/userInfoCollection/userInfoCollection\""
+  },
+  {
+    "slug": "miniapp_scene_param",
+    "string": "/pages/index/index?scene=123,456",
+    "statement": "/pages/index/index?scene=123,456"
+  },
+  {
+    "slug": "miniapp_plugin_url",
+    "string": "plugin-private://wx16c573059683b2ca/components/captcha/captcha",
+    "statement": "\"plugin://wx16c573059683b2ca/captcha\":\n        \"plugin-private://wx16c573059683b2ca/components/captcha/captcha\""
+  },
+  {
+    "slug": "server_url_payment",
+    "string": "/html/weiPay/pay.php",
+    "statement": "url: e.siteInfo.url + \"/html/weiPay/pay.php\""
+  },
+  {
+    "slug": "server_url_auth",
+    "string": "/html/login.php",
+    "statement": "url: e.siteInfo.url + \"/html/login.php\""
+  },
+  {
+    "slug": "pii_phone_name",
+    "string": "telephone=18059892270",
+    "statement": "telephone=18059892270"
+  },
+  {
+    "slug": "pii_email_name",
+    "string": "mail=test@example.com",
+    "statement": "mail=test@example.com"
+  },
+  {
+    "slug": "pii_sfzid_name",
+    "string": "personalid=110101190001020000",
+    "statement": "personalid=110101190001020000"
+  },
+  {
+    "slug": "encoding_base64",
+    "string": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB...",
+    "statement": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB..."
+  },
+  {
+    "slug": "miniapp_noise",
+    "string": "#ffffff",
+    "statement": "Z([3, \"#ffffff\"]);"
+  },
+  {
+    "slug": "miniapp_noise",
+    "string": "Object.defineProperty(String.prototype, \"nv_toString\", { writable: true, value: String.prototype.toString })",
+    "statement": "Object.defineProperty(String.prototype, \"nv_toString\", { writable: true, value: String.prototype.toString })"
+  },
+  {
+    "slug": "encoding_base64",
+    "string": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+    "statement": "e =\n                    \"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\""
+  }
+]
