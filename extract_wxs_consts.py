@@ -5,6 +5,13 @@ import esprima
 import hashlib
 from typing import Any, Dict, List, Optional, Set, NamedTuple, Tuple
 
+# 解析失败时的兜底正则与 JS 提取器共用同一份实现，保证两者的兜底口径一致。
+from extract_js_consts import (
+    FileSlice as _FallbackSlice,
+    extract_generic_strings_regex as _extract_generic_strings_regex,
+    filter_fallback_values as _filter_fallback_values,
+)
+
 ConstRd = NamedTuple("ConstRd", [("ST", str), ("ID", int), ("STMT", str)])
 MIN_STRING_LEN = 4
 
@@ -128,10 +135,15 @@ def extract_from_wxs_text(
     constants: Set[Tuple[str, int, str]] = set()
     try:
         ast = esprima.parseScript(code, loc=True, range=True, tolerant=True)
-    except Exception as e:
-        # For unit tests, failing fast is often better; but for CLI we want a nice error.
-        # Here we return a structured result to avoid crashing.
-        store.add(f"<parse error: {e}>")
+    except Exception:
+        # 解析失败（例如代码里用了 esprima 4.x 不认识的 ?? / ?. / class field）
+        # 时退回通用字符串字面量正则，source 仍然标 wxs。
+        # 注意：不再写入 "<parse error: ...>" 这种假 statement。
+        # 输出同样先 js_unescape 再过白名单，入库的是反转义后的值。
+        for s, sid in _filter_fallback_values(
+            _extract_generic_strings_regex(_FallbackSlice(0, len(code), code), store)
+        ):
+            constants.add((s, sid, "wxs"))
         return constants
 
     walk(ast, [])
