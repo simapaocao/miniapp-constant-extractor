@@ -1,3 +1,13 @@
 constant_ids.py
 .narrafork/
 .worktrees/
+
+# Python 字节码
+__pycache__/
+*.pyc
+
+# 改动前的源码备份
+*.bak_*
+
+# 测试流水线的产出（历史遗留的已跟踪文件不受影响）
+test-result/
