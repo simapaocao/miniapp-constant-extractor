@@ -1,0 +1,5 @@
+{
+  "appid": "wx0000000000000001",
+  "pages": ["pages/index/index"],
+  "setting": { "urlCheck": false }
+}
