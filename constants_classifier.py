@@ -630,12 +630,23 @@ def process_prefixed_url(url_full: str, stmt: str, src: str, sid: int, res: list
     if len(url_body) == 0 or not url_body[0].isalnum():
         return
 
-    # 带凭证的 URL
+    # 带凭证的 URL: user:pass@host 格式
     if "@" in url_body:
-        cred_part, url_body = url_body.split("@", 1)
-        append_result(res, IDT.SERVER_URL_WITH_CREDENTIALS, url_full, src, sid)
-        if ":" in cred_part:
-            append_result(res, IDT.SERVER_CRED_PASSWORD, url_full, src, sid)
+        at_idx = url_body.index("@")
+        cred_part = url_body[:at_idx]
+        rest_part = url_body[at_idx + 1:]
+
+        # 排除 npm scope URL: /@babel/xxx, /@vant/xxx (cred_part 含 /)
+        # 排除 Retina 图片: icon@2x.png, logo@3x.png
+        # 排除路径中的邮箱片段: xxx.com/user@example.com/...
+        is_npm_scope = "/" in cred_part
+        is_retina = len(rest_part) >= 2 and rest_part[0].isdigit() and rest_part[1] == "x"
+
+        if not is_npm_scope and not is_retina:
+            url_body = rest_part
+            append_result(res, IDT.SERVER_URL_WITH_CREDENTIALS, url_full, src, sid)
+            if ":" in cred_part:
+                append_result(res, IDT.SERVER_CRED_PASSWORD, url_full, src, sid)
 
     fs = url_body.split("/")
     if len(fs) < 1 or len(fs[0]) == 0:
@@ -1399,6 +1410,30 @@ def is_cloud_password(s: str, stmt: str) -> bool:
     if re.match(r'^[a-z]+-\d+,?\.', s_lower):
         return False
 
+    # 排除国际化 key: 0 开头后跟字母 (如 0mfield, 0gultiple_type_text)
+    if s[0] == "0" and len(s) > 1 and s[1].isalpha():
+        return False
+
+    # 排除 icon font 名称 (如 icon-gouwuche1., icon_xxx)
+    if s_lower.startswith("icon-") or s_lower.startswith("icon_"):
+        return False
+
+    # 排除纯小写字母的属性名/变量名 (如 readonly, clearable, required)
+    if s.isalpha() and s.islower():
+        return False
+
+    # 排除驼峰命名的函数/变量名 (如 sendOldPhoneSms, checkPhoneNumber, loopArray88)
+    _PWD_CODE_PREFIXES = ("get", "set", "send", "check", "update", "input", "show",
+                          "handle", "on", "is", "has", "can", "do", "will", "did",
+                          "loop", "anonymous", "member", "thumb")
+    if any(s_lower.startswith(p) for p in _PWD_CODE_PREFIXES) and any(c.isupper() for c in s):
+        return False
+
+    # 排除以 . 结尾的纯标识符 (如 newbtn2., icon-xxx1.)
+    # 但保留含特殊字符的密码 (如 Hyn132465.)
+    if s.endswith(".") and s[:-1].replace("-", "").replace("_", "").isalnum():
+        return False
+
     return any(c.isalpha() for c in s)
 
 
@@ -1548,6 +1583,15 @@ def is_app_key(s: str, stmt: str) -> tuple:
     if not check_length_range(s, 10, 40) or s.isdigit():
         return (False, None)
     if not is_alnum_extended(s) or not any(c.isalpha() for c in s):
+        return (False, None)
+    # 排除纯小写字母（变量名/页面名，如 editaccount, presuccess）
+    if s.islower() and s.isalpha():
+        return (False, None)
+    # 排除驼峰命名模式（如 editAccount, getUserInfo）
+    if s[0].islower() and any(c.isupper() for c in s):
+        return (False, None)
+    # 要求包含数字（真正的 API Key 几乎都有数字）
+    if not any(c.isdigit() for c in s):
         return (False, None)
     return (True, IDT.PLATFORM_APP_SECRET)
 
@@ -1870,7 +1914,64 @@ def process_generic_dot_prefixed_constant(s: str, stmt: str, src: str, sid: int,
 
 def process_generic_slash_prefixed_constant(s: str, stmt: str, src: str, sid: int, results: list):
     """处理斜杠开头的常量"""
-    pass
+    s_lower = s.lower()
+
+    # 1. 排除相对路径模块引用 (./xxx, ../xxx, /./xxx)
+    if s.startswith("./") or s.startswith("../") or s.startswith("/./"):
+        return
+
+    # 2. 模块文件引用
+    if any(s_lower.endswith(ext) for ext in MINIAPP_MODULE_EXTENSIONS):
+        append_result(results, IDT.MINIAPP_PATH_MODULE, s, src, sid)
+        return
+
+    # 3. 资源文件引用
+    if any(s_lower.endswith(ext) for ext in MINIAPP_ASSET_EXTENSIONS):
+        append_result(results, IDT.MINIAPP_PATH_ASSET, s, src, sid)
+        return
+
+    # 4. 包含协议头的不在这里处理 (应该已被 URL 分支捕获)
+    if "://" in s:
+        return
+
+    # 5. 排除小程序框架/npm 模块引用路径
+    _MODULE_PATH_MARKERS = (
+        "miniprogram_npm/", "node_modules/", "uni_modules/",
+        "@babel/", "@vant/", "uview-ui/",
+        "/dist/", "/assets/dist/",
+    )
+    if has_keyword_substring(s_lower, _MODULE_PATH_MARKERS):
+        append_result(results, IDT.MINIAPP_PATH_MODULE, s, src, sid)
+        return
+
+    # 6. 排除组件引用路径 (/components/xxx/xxx 且不含 api/v1 等 API 特征)
+    if s_lower.startswith("/components/") and not has_keyword_substring(s_lower, MINIAPP_API_PATH_PATTERNS):
+        append_result(results, IDT.MINIAPP_PATH_MODULE, s, src, sid)
+        return
+
+    # 7. 带查询参数的 API 路径
+    if "?" in s and "=" in s:
+        process_url_query_string(s, stmt, src, sid, results)
+        append_result(results, IDT.MINIAPP_API_PARAMS, s, src, sid)
+        return
+
+    # 8. 敏感路径关键字检测 (login/auth/pay/admin 等)
+    for keyword, slug_id in URL_SENSITIVE_KEYWORDS.items():
+        if keyword in s_lower:
+            append_result(results, slug_id, s, src, sid)
+            return
+
+    # 9. 后端 API 路径特征判断
+    #    - 去掉开头的 / 后，至少有一段包含字母
+    #    - 长度 >= 4
+    #    - 不是纯数字路径
+    segments = [seg for seg in s.strip("/").split("/") if seg]
+    if not segments:
+        return
+    has_alpha_segment = any(any(c.isalpha() for c in seg) for seg in segments)
+    if has_alpha_segment and len(s) >= 4:
+        append_result(results, IDT.MINIAPP_API_PARAMS, s, src, sid)
+        return
 
 
 def process_generic_unknown_constant(s: str, stmt: str, src: str, sid: int, res: list):
@@ -2023,10 +2124,10 @@ def perform_constant_classifying(statements: List[str], constants: List):
         if (re.match(r"^[a-f0-9]{48}$", s_lower) or
             re.match(r"^[a-f0-9]{64}$", s_lower) or
             re.match(r"^04[a-f0-9]{128}$", s_lower)):
+            res_len_before = len(res)
             process_Regex_crypto_key(s, stmt, src, sid, res, raw_stmt)
-            consumed = True
-        if consumed:
-            continue
+            if len(res) > res_len_before:
+                continue
 
         # 小程序 API 路径
         if is_miniapp_api_params(s):
@@ -2089,15 +2190,6 @@ def perform_constant_classifying(statements: List[str], constants: List):
         is_cloud_tok, _ = is_cloud_token(s)
         if is_cloud_tok:
             process_cloud_token(s, stmt, src, sid, res)
-            continue
-            
-        # Token 前缀检测
-        for pattern, token_type in TOKEN_PREFIX_WORDS.items():
-            if s.startswith(pattern):
-                process_prefixed_token(token_type, s, stmt, src, sid, res)
-                consumed = True
-                break
-        if consumed:
             continue
 
         # Hex Token

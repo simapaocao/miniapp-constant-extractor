@@ -16,6 +16,122 @@ MINI_FUNC_SIZE = 60  # Small function: Minified: ~80–400 bytes; Gzipped: ~60�
 MIN_STRING_LEN = 4
 
 
+# ---- JS 字符串反转义：\xHH  \uHHHH  \u{H..}  \n \t \r \b \f \v \0，其余 \c -> c ----
+_JS_ESC_RE = re.compile(r"\\(x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]{1,6}\}|u[0-9a-fA-F]{4}|.)", re.S)
+_JS_SIMPLE_ESC = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
+
+
+def js_unescape(s: str) -> str:
+    if "\\" not in s:
+        return s
+
+    def _rep(m):
+        g = m.group(1)
+        try:
+            if g[0] == "x" and len(g) == 3:
+                return chr(int(g[1:], 16))
+            if g.startswith("u{"):
+                return chr(int(g[2:-1], 16))
+            if g[0] == "u" and len(g) == 5:
+                return chr(int(g[1:], 16))
+        except ValueError:
+            return m.group(0)          # 越界码点（如 \u{110000}）：保留原文
+        # 其余 \c 一律还原成 c。形如 \uZZZZ 的非法转义不命中前两个分支，
+        # 会落到 "." 分支得到 "u"，结果是 "uZZZZ"（反斜杠被去掉）。
+        # 这种写法在 JS 里本身就是语法错误，按普通字符处理即可。
+        return _JS_SIMPLE_ESC.get(g, g)
+
+    return _JS_ESC_RE.sub(_rep, s)
+
+
+# ---- 白名单：按顺序 fullmatch，命中第一个即返回类名 ----
+_WL_SEG = r"[A-Za-z0-9._~%@+\-]"
+_WL_QS = r"(?:\?[A-Za-z0-9._~%@+\-=&/,:;]*)?"
+
+FALLBACK_RULES = [
+    ("url", re.compile(
+        r"(?i:(?:https?|wss?|ftp|cloud|cos|oss|s3|plugin|plugin-private)://)"
+        r"[^\s\"'<>\\^`{}|]+")),
+    ("abs_path", re.compile(r"/(?!/)" + _WL_SEG + r"+(?:/" + _WL_SEG + r"*)*" + _WL_QS)),
+    ("rel_path", re.compile(r"\.\.?/" + _WL_SEG + r"+(?:/" + _WL_SEG + r"*)*" + _WL_QS)),
+    ("bare_path", re.compile(r"[A-Za-z0-9_@]" + _WL_SEG + r"*(?:/" + _WL_SEG + r"+)+/?" + _WL_QS)),
+    ("wx_appid", re.compile(r"wx[0-9a-f]{16}")),
+    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}")),
+    ("cloud_ak", re.compile(r"(?:LTAI|AKID|AKIA|ASIA|ABIA|ACCA)[A-Za-z0-9]{12,40}")),
+    ("token_prefix", re.compile(
+        r"(?:ghp_|gho_|ghu_|ghs_|ghr_|glpat-|xox[bpar]-|sk_live_|sk_test_|rk_live_|pk_live_|SG\.)"
+        r"[A-Za-z0-9_.\-]{16,}")),
+    ("auth_header", re.compile(r"(?:Bearer|Basic) [A-Za-z0-9+/=._\-]{10,}")),
+    ("google_key", re.compile(r"AIza[0-9A-Za-z_\-]{35}")),
+    ("tmap_key", re.compile(r"[A-Z0-9]{5}(?:-[A-Z0-9]{5}){5}")),
+    ("pem", re.compile(r"-----BEGIN [A-Z ]+-----[\s\S]*")),
+    ("der_key_b64", re.compile(r"MI[IG][A-Za-z0-9+/]{60,}={0,2}")),
+    ("hex_secret", re.compile(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")),
+    ("email", re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+")),
+    ("ipv4", re.compile(r"(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?")),
+    ("cn_mobile", re.compile(r"1[3-9]\d{9}")),
+    ("cn_id18", re.compile(r"\d{17}[\dXx]")),
+]
+_WL_PATH_KINDS = {"abs_path", "rel_path", "bare_path"}
+_WL_ENTROPY_KINDS = {"der_key_b64", "hex_secret"}
+_WL_HAS_ASCII_ALPHA = re.compile(r"[A-Za-z]")
+# 第三方依赖路径：不收（用户要求）。按路径段匹配，不做子串匹配。
+_WL_THIRD_PARTY_SEGMENTS = ("@babel", "miniprogram_npm", "node_modules")
+
+
+def _is_third_party_path(v: str) -> bool:
+    """路径里任一段（按 / 切分，去掉查询串）等于第三方依赖目录名即视为第三方路径。"""
+    path = v.split("?", 1)[0]
+    return any(seg in _WL_THIRD_PARTY_SEGMENTS for seg in path.split("/"))
+
+
+def fallback_value_kind(value: str):
+    """value 须已经过 js_unescape。返回白名单类名；不收则返回 None。"""
+    v = value.strip()
+    if len(v) < 4:
+        return None
+    for kind, rx in FALLBACK_RULES:
+        # 通用前置条件：不含换行。pem 例外（PEM 本身多行）。
+        if kind != "pem" and ("\n" in v or "\r" in v):
+            continue
+        if not rx.fullmatch(v):
+            continue
+        if kind in _WL_PATH_KINDS and not _WL_HAS_ASCII_ALPHA.search(v):
+            continue                    # 排除 /0/1 这类纯数字路径
+        if kind in _WL_PATH_KINDS and _is_third_party_path(v):
+            return None             # 第三方依赖路径：整条不收
+        if kind in _WL_ENTROPY_KINDS and len(set(v)) < 8:
+            continue                    # 排除 0000... 这类占位串
+        return kind
+    return None
+
+
+def is_compiled_style_file(path: str) -> bool:
+    """编译样式文件（如 app-wxss.js）判定：只看文件名，不看内容。"""
+    name = (path or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return (
+        name == "app-wxss.js"
+        or name.endswith("-wxss.js")
+        or name.endswith(".wxss.js")
+    )
+
+
+def filter_fallback_values(found: Set[Tuple[str, int]]) -> Set[Tuple[str, int]]:
+    """对兜底输出做 js_unescape + 白名单过滤；入库的是反转义后的值。
+
+    返回 None 的（不在白名单里）一律丢弃。statement_id 原样保留。
+    """
+    out: Set[Tuple[str, int]] = set()
+    for s, sid in found:
+        if not isinstance(s, str):
+            continue
+        v = js_unescape(s)
+        if fallback_value_kind(v) is None:
+            continue
+        out.add((v, sid))
+    return out
+
+
 class StatementStore:
     """Deduplicate statement strings by hash and assign stable integer ids."""
 
@@ -55,8 +171,11 @@ class JSParseContext:
     线程/进程安全的解析上下文，避免全局变量在多进程环境下的竞争问题。
     每次解析一个文件时创建一个新的上下文实例。
     """
-    def __init__(self, content: str):
+    def __init__(self, content: str, fallback_enabled: bool = True):
         self.content = content
+        # 是否启用"上一轮新增的兜底"（编译样式文件关闭）。
+        # 放在 ctx 上而不是模块级全局变量，避免多进程下互相影响。
+        self.fallback_enabled = fallback_enabled
         self.func_locs = self._locate_functions_regex(content)
     
     @staticmethod
@@ -259,8 +378,14 @@ def get_function_bodies(
 
 def extract_function_strings_via_ast(
     file_slice: FileSlice, store: StatementStore
-) -> Set[Tuple[str, int]]:
-    """Parse a code block and extract (string_value, statement_id)."""
+) -> Tuple[Set[Tuple[str, int]], bool]:
+    """Parse a code block and extract (string_value, statement_id).
+
+    Returns ``(found, parse_ok)``.  ``parse_ok`` tells the caller whether
+    esprima could parse the block at all, so a block that parsed but contained
+    no strings can be told apart from a block that failed to parse (the latter
+    needs the regex fallback).
+    """
     code_block = file_slice.C
 
     def push_child(stack: List[Any], v: Any) -> None:
@@ -332,7 +457,7 @@ def extract_function_strings_via_ast(
             code_block, options={"range": True, "tolerant": True}
         )
     except Exception:
-        return found
+        return found, False
 
     parent_map: Dict[int, Any] = {}
 
@@ -413,32 +538,58 @@ def extract_function_strings_via_ast(
             for _, v in items:
                 push_child(nodes, v)
 
-    return found
+    return found, True
 
 
 def extract_chunk_strings_via_ast(
     file_slice: FileSlice, store: StatementStore
 ) -> Tuple[Set[Tuple[str, int]], bool]:
-    """Parse semi-colon terminated chunks and extract strings."""
-    size = 0
-    start = 0
+    """Parse semi-colon terminated chunks and extract strings.
+
+    Returns ``(found, consumed)``.  ``consumed`` is True only when *every*
+    block parsed successfully and the parsed blocks cover (almost) the whole
+    chunk.  A chunk with at least one unparsable block is handed back to the
+    caller so the regex fallback can run on it -- previously a short chunk
+    where nothing parsed was wrongly reported as consumed.
+    """
     code_block = file_slice.C
-    nextp = code_block.find(";", start)
     found: Set[Tuple[str, int]] = set()
+    size = 0  # bytes covered by blocks that parsed successfully
+    all_ok = True
+    start = 0
 
-    while nextp != -1:
+    while True:
+        nextp = code_block.find(";", start)
+        if nextp == -1:
+            break
+
         blk = code_block[start : nextp + 1]
-
         blk_slice = FileSlice(0, len(blk), blk)
-        ast_res = extract_function_strings_via_ast(blk_slice, store)
-        if ast_res:
-            found.update(ast_res)
+        ast_res, parse_ok = extract_function_strings_via_ast(blk_slice, store)
+        if parse_ok:
             size += len(blk)
+            if ast_res:
+                found.update(ast_res)
+        else:
+            all_ok = False
 
         start = nextp + 1
-        nextp = code_block.find(";", start)
 
-    return found, (len(code_block) - size) < MINI_FUNC_SIZE
+    # 最后一个 ';' 之后的非空白尾巴也是一块（原来从来不解析）
+    if start < len(code_block):
+        tail = code_block[start:]
+        if tail.strip():
+            tail_slice = FileSlice(0, len(tail), tail)
+            ast_res, parse_ok = extract_function_strings_via_ast(tail_slice, store)
+            if parse_ok:
+                size += len(tail)
+                if ast_res:
+                    found.update(ast_res)
+            else:
+                all_ok = False
+
+    consumed = all_ok and (len(code_block) - size) < MINI_FUNC_SIZE
+    return found, consumed
 
 
 def _extract_from_long_line(line: str, store: StatementStore) -> Set[Tuple[str, int]]:
@@ -595,6 +746,104 @@ def extract_global_strings_regex(
     return found
 
 
+# ============ 通用字符串字面量兜底正则 ============
+# 用于 esprima 解析失败的代码块：只认"字符串长什么样"，不依赖语法结构。
+#
+# 三个分支都是"互斥的单字符分支"写法（[^"\\\n] 与 \\. 不会匹配同一个字符），
+# 所以匹配是线性的，不会出现灾难性回溯：
+#   "..."  -> 双引号字符串
+#   '...'  -> 单引号字符串
+#   `...`  -> 不含 ${ 的模板字符串（\$(?!\{) 排除了插值起始）
+GENERIC_STRING_RE = re.compile(
+    r'"(?:[^"\\\n]|\\.)*"'
+    r"|'(?:[^'\\\n]|\\.)*'"
+    r"|`(?:[^`\\$]|\$(?!\{)|\\.)*`"
+)
+
+# 兜底时 statement 的长度上限；超过则截取匹配附近的上下文。
+MAX_FALLBACK_STMT_LEN = 512
+
+
+def _newline_positions(text: str) -> List[int]:
+    """所有换行的下标，升序。用 str.find 扫描，避免逐字符的 Python 循环。"""
+    positions: List[int] = []
+    pos = text.find("\n")
+    while pos != -1:
+        positions.append(pos)
+        pos = text.find("\n", pos + 1)
+    return positions
+
+
+def _stmt_for_match(
+    text: str, newlines: List[int], start: int, end: int
+) -> str:
+    """取匹配所在的那一行作为 statement；行太长就截取匹配附近的上下文。
+
+    用预计算好的换行表做二分查找，并且绝不整体复制超长行 —— 否则 1 MB 单行
+    压缩 JS 上每条匹配都要扫一遍全文/复制一次全文，退化成 O(n^2)。
+    """
+    idx = bisect.bisect_left(newlines, start)
+    line_start = newlines[idx - 1] + 1 if idx > 0 else 0
+
+    jdx = bisect.bisect_left(newlines, end)
+    line_end = newlines[jdx] if jdx < len(newlines) else len(text)
+
+    # 在 [line_start, line_end) 上就地求 strip 后的边界，不复制整行
+    ls = line_start
+    le = line_end
+    while ls < le and text[ls].isspace():
+        ls += 1
+    while le > ls and text[le - 1].isspace():
+        le -= 1
+    if ls >= le:
+        return "<unknown statement>"
+
+    line_len = le - ls
+    if line_len <= MAX_FALLBACK_STMT_LEN:
+        return text[ls:le]
+
+    rel_s = start - ls
+    rel_e = end - ls
+    ctx_start = max(0, rel_s - 200)
+    ctx_end = min(line_len, rel_e + 200)
+
+    snippet = text[ls + ctx_start : ls + ctx_end]
+    if ctx_start > 0:
+        snippet = "..." + snippet
+    if ctx_end < line_len:
+        snippet = snippet + "..."
+    return snippet[:MAX_FALLBACK_STMT_LEN]
+
+
+def extract_generic_strings_regex(
+    file_slice: FileSlice, store: StatementStore
+) -> Set[Tuple[str, int]]:
+    """解析失败时使用的兜底：直接扫出代码里的字符串字面量。
+
+    只应作用在 esprima 解析失败的块上（见 extract_from_js_text /
+    extract_chunk_strings_via_ast 的调用点）。取到的值是源码里的原始文本
+    （不做反转义），statement 取匹配所在行。
+    """
+    found: Set[Tuple[str, int]] = set()
+    content = file_slice.C
+    if not content:
+        return found
+
+    newlines = _newline_positions(content)
+
+    for m in GENERIC_STRING_RE.finditer(content):
+        raw = m.group(0)
+        if len(raw) < 2:
+            continue
+        val = raw[1:-1]
+        if not val:
+            continue
+        stmt = _stmt_for_match(content, newlines, m.start(), m.end())
+        found.add((val.strip(), store.add(stmt)))
+
+    return found
+
+
 def extract_from_js_text(
     start: int,
     end: int,
@@ -619,20 +868,42 @@ def extract_from_js_text(
 
     # 获取文件内容
     content = ctx.content if ctx else JS_FILE_CONTENT
-    
+
+    # 兼容模式（ctx 为 None）下视为启用兜底
+    fallback_enabled = ctx.fallback_enabled if ctx is not None else True
+
     bodies, chunks = get_function_bodies(start, end, content)
 
     results: Set[Tuple[str, int, str]] = set()
 
     for b in bodies:
-        ast_res = extract_function_strings_via_ast(b, store)
+        ast_res, parse_ok = extract_function_strings_via_ast(b, store)
+        # 这个函数体里已经找到的字符串值，兜底时不重复加入
+        body_values: Set[str] = set()
+
         if ast_res:
             for s, sid in ast_res:
                 results.add((s, sid, "js-ast"))
+                body_values.add(s)
         else:
             func_pos = find_func_pos_between(b.S, b.E, ctx)
             if func_pos is not None and b.S < func_pos < b.E:
-                results.update(extract_from_js_text(func_pos, b.E, store, visited, ctx))
+                inner = extract_from_js_text(func_pos, b.E, store, visited, ctx)
+                for s, _sid, _src in inner:
+                    body_values.add(s)
+                results.update(inner)
+
+        # 解析失败：整个函数体再跑一遍兜底（原来只会递归内层函数，
+        # 外层函数体里的字符串全部丢失）。
+        # 两路输出都先 js_unescape 再过白名单，入库的是反转义后的值。
+        if not parse_ok and fallback_enabled:
+            body_slice = FileSlice(b.S, b.E, b.C)
+            fallback = extract_global_strings_regex(body_slice, store)
+            fallback |= extract_generic_strings_regex(body_slice, store)
+            for s, sid in filter_fallback_values(fallback):
+                if s in body_values:
+                    continue
+                results.add((s, sid, "js-regex"))
 
     data_blocks: List[FileSlice] = []
     for c in chunks:
@@ -643,8 +914,16 @@ def extract_from_js_text(
             data_blocks.append(c)
 
     for d in data_blocks:
+        # 旧路径：行为完全不变 —— 不反转义、不过白名单，也不受
+        # fallback_enabled 影响（旧版本来就有的逻辑，保证不丢旧值）。
         for s, sid in extract_global_strings_regex(d, store):
             results.add((s, sid, "js-regex"))
+        # 新增兜底：只在 fallback_enabled 时运行，输出反转义 + 白名单。
+        if fallback_enabled:
+            for s, sid in filter_fallback_values(
+                extract_generic_strings_regex(d, store)
+            ):
+                results.add((s, sid, "js-regex"))
 
     return results
 
@@ -659,7 +938,8 @@ def extract_from_js_file(path: str) -> Dict[str, Any]:
         content = f.read()
 
     # 创建独立的解析上下文，避免多进程环境下的全局变量竞争
-    ctx = JSParseContext(content)
+    # 编译样式文件（app-wxss.js / *.wxss.js）关闭本轮新增的兜底
+    ctx = JSParseContext(content, fallback_enabled=not is_compiled_style_file(path))
 
     store = StatementStore()
     res = extract_from_js_text(0, len(content), store, ctx=ctx)
