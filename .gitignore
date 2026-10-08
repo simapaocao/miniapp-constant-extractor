@@ -1,4 +1,6 @@
-constant_ids.py
+# constant_ids.py 已纳入版本控制：它由 constant_types.json 确定性生成，
+# 且被 constants_classifier / scanner_engine 直接 import。改了 taxonomy 后
+# 需重跑 constants_type2id.py 并把新生成的文件一起提交。
 .narrafork/
 .worktrees/
 
