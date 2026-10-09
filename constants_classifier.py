@@ -238,6 +238,26 @@ CLOUD_REGION_PREFIX_WORDS = [
     "cn-", "ap-", "us-", "eu-", "sa-", "me-", "af-", "na-",
 ]
 
+# 区域名 = <前缀>-<方向词或地域节点>[-<数字>]。前缀只有两个字母，光看前缀会把
+# CSS/BEM 类名整批吞掉（me-service / sa-image__img / na-big-pic / us-close / ap-page），
+# 所以第二段必须是真地域名。见 is_cloud_region_value。
+CLOUD_REGION_DIRECTION_WORDS = (
+    "north", "south", "east", "west", "central",
+    "northeast", "northwest", "southeast", "southwest",
+)
+CLOUD_REGION_PLACE_WORDS = (
+    # 腾讯 COS / 阿里 OSS / AWS S3 / 华为 OBS 的地域节点名
+    "beijing", "shanghai", "guangzhou", "shenzhen", "chengdu", "hangzhou",
+    "nanjing", "chongqing", "wuhan", "changsha", "xian", "jinan", "fuzhou",
+    "hongkong", "taipei", "macau",
+    "singapore", "tokyo", "osaka", "seoul", "mumbai", "bangkok", "jakarta",
+    "kualalumpur", "manila", "hanoi", "hochiminh", "sydney", "melbourne",
+    "siliconvalley", "ashburn", "virginia", "toronto", "dallas", "seattle",
+    "saopaulo", "santiago", "frankfurt", "london", "dublin", "paris",
+    "amsterdam", "milan", "madrid", "stockholm", "zurich", "moscow",
+    "dubai", "riyadh", "johannesburg", "cairo",
+)
+
 BUCKET_CONTEXT_WORDS = (
     "bucket", "bucketname", "bucket_name",
     "ossbucket", "oss_bucket", "cosbucket", "cos_bucket",
@@ -460,12 +480,21 @@ IV_STR_LENGTHS = (8, 12, 16)
 #
 # 逐条排除的「词」特征，代价在 test-result/iv-fix/ 用 3 个真库语料 + 模拟真实 IV 量化：
 #   1) 纯数字 / 全大写 / SCREAMING_SNAKE —— 随机字节串的概率 < 1e-3
-#   2) 含 -/_ 的纯词串（[A-Za-z0-9-_]）—— 见 is_iv_identifier_like 的说明
+#   2) 含 -/_ 且切段后「像词的字符过半」—— kebab / snake / BEM（见 is_iv_word_token）
 #   3) 驼峰 / 帕斯卡单词串 —— 每段是「大写 + ≥2 个小写」的真单词（见下方说明）
 RE_IV_WORD_TOKEN = re.compile(r"^[-_A-Za-z0-9]+$")
 RE_IV_SCREAMING = re.compile(r"^[A-Z0-9]+(?:_[A-Z0-9]+)*$")
 RE_IV_CAMEL_WORDS = re.compile(r"^[a-z0-9]+(?:[A-Z][a-z]{2,}[a-z0-9]*)+$")
 RE_IV_PASCAL_WORDS = re.compile(r"^[A-Z][a-z]{2,}[a-z0-9]*(?:[A-Z][a-z]{2,}[a-z0-9]*)+$")
+
+# 判据 2 的词段特征：把 -/_ 当词边界切段，再问「多少字符落在像词的段里」。
+#   [a-z]{2,}[0-9]*    小写单词（可带尾随数字）: passive / customer / latitude / sf2 / kuaidi100
+#   [A-Z][a-z]{2,}[0-9]*  首字母大写的单词:      Letter / Uppercase / FluidR3
+#   [A-Z]{2,}[0-9]*    全大写缩写:               GM / API / ID
+#   is_word_shaped_identifier 驼峰/帕斯卡词串:   ClassDetail / footerBtn / baseUrlLocal
+RE_IV_WORD_SEG_LOWER = re.compile(r"[a-z]{2,}[0-9]*")
+RE_IV_WORD_SEG_CAP = re.compile(r"[A-Z][a-z]{2,}[0-9]*")
+RE_IV_WORD_SEG_ABBR = re.compile(r"[A-Z]{2,}[0-9]*")
 
 IV_VALUE_BLACKLIST = (
     "enterkeyhint", "controlslist", "autocomplete", "hreflang", "datetime",
@@ -514,6 +543,21 @@ APP_SECRET_CONTEXT_WORDS = {
     "signappid", "sign_app_id",
     "wxcontactkey", "wx_contact_key", "alipayappid", "alipay_app_id",
 }
+
+# 会话密钥的语境词。24 字符 base64(16B) 这个形态本身没有区分度（三库 2632 行
+# platform_session_key 里 89.8% 的上下文是 LogPid / alipayPid 这类日志流水号），
+# 必须靠语境收敛。这里只放有实测支撑的两个词：
+#   session_key:"DqoBcsyp60OUVOSydoE37Q==" / sessionKey: "n2a6ZXGM8toABFypcQjEow=="
+#     / e.session_key = "SNzPSsB9wKBGzrftrjK13g=="
+# 三个库全部 8 行「上下文含 session」的记录都被这两个词覆盖（sessionKey 经 stmt.lower()
+# 后含 sessionkey）。
+# 刻意不加 code2session / checkSession / encryptedData：旧判据没有语境要求，
+# 所有 24 字符 base64 形态的值都已经被判成 session_key（三库 2632 行即是全部），
+# 所以不存在「该判而没判」的漏报，加宽语境只会把更多噪音留在 risk 5 类型里；
+# 而 encryptedData 语句里那个 24 字符 base64 是密文/16 字节 IV，不是密钥本身。
+SESSION_KEY_CONTEXT_WORDS = (
+    "session_key", "sessionkey",
+)
 
 BUCKET_VALUE_BLACKLIST = (
     "bucket", "token", "secret", "key", "name", "list",
@@ -702,8 +746,28 @@ def process_Regex_crypto_key(s: str, stmt: str, src: str, sid: int, res: list, r
 # =========================================================
 # URL 处理函数
 # =========================================================
+# W3C / XML 命名空间标识符（xmlns / setAttributeNS 里的值）是 XML 规范定义的协议常量，
+# 不是接口端点。三库实测 16 个去重值 / 11174 行，引用次数畸高
+# （"http://www.w3.org/2000/svg" 单个值 3696 行），会把 server_url_api_plain 里
+# 按「出现次数」做的统计带偏。
+# 归到 other，与 is_framework_artifact（data-v-<hash> / wx: 属性）同一思路：
+# 协议/框架产物不是业务常量。不放进 server_url_noise —— 后者在 process_prefixed_url
+# 里的含义是「没有 host 的退化 URL」，命名空间 URL 形态完好，混进去会模糊那个信号。
+RE_W3C_NAMESPACE_URL = re.compile(r"^https?://www\.w3\.org(?:/|$)", re.I)
+
+
+def is_w3c_namespace_url(url_full: str) -> bool:
+    """是否为 W3C / XML 命名空间标识符（xmlns 的值）"""
+    return bool(RE_W3C_NAMESPACE_URL.match(url_full.strip()))
+
+
 def process_prefixed_url(url_full: str, stmt: str, src: str, sid: int, res: list):
     """分类 URL"""
+    # W3C/XML 命名空间不是接口端点（见 is_w3c_namespace_url）
+    if is_w3c_namespace_url(url_full):
+        append_result(res, IDT.OTHER, url_full, src, sid)
+        return
+
     url_body = url_full
     for prefix in URL_PREFIX_WORDS:
         if url_full.lower().startswith(prefix):
@@ -826,14 +890,57 @@ def is_cloud_region_value(s: str) -> bool:
     COS 模板语句里 {{Region}} 与 {{Bucket}} 并存，而 is_bucket_name 在主链上先于区域
     判定运行，会把区域名吞成桶名（cn-southwest → cloud_bucket_name），所以桶判定必须
     显式给区域形态的值让路。
+
+    原判据只有「前缀命中 + 长度 <30 + 不含 / 和 .」，而 cn-/ap-/us-/eu-/sa-/me-/af-/na-
+    这 8 个前缀都是两个字母，正好和 CSS/BEM 类名前缀重合，于是 me-service / me-avatar /
+    sa-image__img / na-big-pic / us-close / ap-page / cn-money / cn-big5 / us-ascii /
+    na-xie-di-fang-zhi-de-qu 这一大批类名与字符编码名都被判成了云区域（三库 4369 行里
+    约 3000 行）。现在要求第二段真的是地域名：
+      - 方向词 north / south / east / west / central / …  → cn-southwest / us-east-1 /
+        cn-south-2 / cn-northwest-1 / me-central-1
+      - 已知地域节点名（各家对象存储的地域）           → ap-shanghai / cn-hangzhou /
+        ap-chengdu / ap-guangzhou / ap-beijing / na-toronto / eu-moscow
+      - 其后只允许「一段纯数字」后缀                   → cn-south-2 / ap-shanghai-1
+    没有方向词/节点名兜底的（ap-page / cn-money / me-service / sa-hover-menu …）一律不当
+    区域，交回主链按上下文判定。已用三库 cloud_region 语料逐值核过，见报告。
     """
-    if not s:
+    if not s or len(s) >= 30 or "/" in s or "." in s:
         return False
     s_lower = s.lower()
     for prefix in CLOUD_REGION_PREFIX_WORDS:
-        if s_lower.startswith(prefix):
-            return len(s) < 30 and "/" not in s and "." not in s
+        if not s_lower.startswith(prefix):
+            continue
+        parts = s_lower[len(prefix):].split("-")
+        if (parts[0] not in CLOUD_REGION_DIRECTION_WORDS
+                and parts[0] not in CLOUD_REGION_PLACE_WORDS):
+            return False
+        return all(p.isdigit() for p in parts[1:])
     return False
+
+
+def has_bucket_blacklist_word_in_head(s: str) -> bool:
+    """BUCKET_VALUE_BLACKLIST 是否命中值的**首段**（第一个 `-` 之前）。
+
+    原实现是 has_keyword_substring(s_lower, BUCKET_VALUE_BLACKLIST)，即「短词裸子串」：
+    只要值里任意位置出现 video / key / name / time / url … 就整值否决，与 uid→Guide
+    是同一类错（裸子串没有词边界）。但直接改成「词段匹配」在这里修不好目标值：
+    `eqxiu-video` 按 `-` 切出来的第二段就是独立的 `video`，词段匹配照样命中。
+
+    实测（三库中 source_snippet 含 bucket 语境词的全部记录 = 能走到这一步的完整集合，
+    121 个去重值）：裸子串匹配总共只命中 1 个值 —— 而它是唯一的错杀：
+      "videoBucket", o>0?"eqxiu-video":"eqxiu-test"
+        → eqxiu-test 判 cloud_bucket_name，eqxiu-video 却被 "video" 否决，
+          最后掉到 payment_pay_sign。
+    改成「首段命中」后：
+      - eqxiu-video（通用词在尾部 = 「品牌-用途」型桶名，正是 COS 桶名的常见形态）
+        → 放行，与 eqxiu-test 一致
+      - bucket-name / image-list / key-value / videoBucket 这类**以通用词开头**、
+        看着像变量名的值 → 仍然否决
+      - 值里没有 `-` 时首段就是整个值，行为与原实现完全一致（bucketname 仍否决）
+
+    is_bucket_name 在此处已保证 s 是全小写且只含 [a-z0-9-]，所以首段就是 split("-")[0]。
+    """
+    return has_keyword_substring(s.split("-", 1)[0], BUCKET_VALUE_BLACKLIST)
 
 
 def is_bucket_name(s: str, stmt: str) -> bool:
@@ -850,8 +957,8 @@ def is_bucket_name(s: str, stmt: str) -> bool:
     if not re.match(r'^[a-z0-9][a-z0-9-]*[a-z0-9]$', s) or s.isdigit():
         return False
 
-    # 语义黑名单
-    if has_keyword_substring(s_lower, BUCKET_VALUE_BLACKLIST):
+    # 语义黑名单（只看首段，见 has_bucket_blacklist_word_in_head）
+    if has_bucket_blacklist_word_in_head(s):
         return False
 
     # 区域形态的值是区域名，不是桶名（让位给更具体的区域判定）
@@ -1101,9 +1208,38 @@ def process_ak_sk_pair(ak_val: str, ak_stmt: str, sk_val: str, sk_stmt: str,
 # =========================================================
 # Session Key 检测
 # =========================================================
-def is_session_key(s: str) -> bool:
-    """判断是否为微信/支付宝 Session Key"""
+def has_session_key_context(stmt: str) -> bool:
+    """上下文是否处在会话密钥的语境里（见 SESSION_KEY_CONTEXT_WORDS）"""
+    return has_keyword_in_context(stmt, SESSION_KEY_CONTEXT_WORDS)
+
+
+def is_session_key(s: str, stmt: str) -> bool:
+    """判断是否为微信/支付宝 Session Key（24 字符 base64 = 16 字节密钥）。
+
+    原判据「只判 24 字符 base64 + 16 字节 + 熵 >= 3.0 + 可打印 < 12」不看上下文，
+    于是任何符合该形态的值都会命中。三库实测 2632 行 / 286 个去重值里：
+      - 89.8% 的上下文含 pid/log（LogPid: "opbiznojnzl7iml6kgpmjw==" —— 日志流水号）
+      - 只有 0.3%（8 行 / 6 个值）的上下文真的提到 session
+    故新增两条收敛，均以「当前代码下仍然命中」的语料为基准：
+
+    1) 语境要求：stmt 必须落在 session_key / sessionkey 语境（见
+       SESSION_KEY_CONTEXT_WORDS）。stmt 是**必填**参数，没有默认值 —— 形态本身
+       毫无区分度，任何「没传上下文就不要求语境」的默认值都会把 89.8% 的噪音
+       原样放回来，等于给未来调用者留了个无声的坑。生产链路
+       perform_constant_classifying 里唯一的调用点与测试都显式传 stmt。
+    2) 形态收紧：拒绝「22 个有效字符里一个大写字母都没有」的值。
+       16 字节真随机值的 base64 每个 6-bit 组落在非大写字符集 {a-z,0-9,+,/}
+       （38/64 个字符）内的概率是 38/64，22 组同时如此的概率 ≈ (38/64)^22 ≈ 1e-5。
+       而三库 286 个去重值里有 126 个（44%）无大写 —— 真随机密钥出现这种情况的概率
+       ≈ 1e-109，是不可能事件，说明这些值的字符集是被构造出来的，不是随机密钥
+       （实测这 126 个值解码后 6-bit 组均匀落在 [26,63]，正是「字符集被限制在大写以外」
+       的特征）。代价：真随机密钥被这条误杀的概率 ≈ 1e-5/个。
+    """
+    if not has_session_key_context(stmt):
+        return False
     if len(s) != 24 or not s.endswith("=="):
+        return False
+    if not any(c.isupper() for c in s[:22]):
         return False
     try:
         decoded_bytes = base64.b64decode(s, validate=True)
@@ -1638,12 +1774,12 @@ def is_iv_identifier_like(s: str) -> bool:
 
       1. 纯数字：12 位随机 base64 全为数字的概率 (10/64)^12 ≈ 1e-10
       2. SCREAMING_SNAKE / 全大写：22 位随机 base64 全在 [A-Z0-9_] 内 ≈ 1e-6
-      3. 含 -/_ 且其余字符是字母数字：即 kebab / snake / BEM（含首尾、连续分隔符，
-         如 _customer_latitude_cache / at-tab-bar__item / isEnterPictureInPicture-）。
-         随机 base64 里 -/_ 只占 2/64 ≈ 3%，而标识符里它们是词边界，占比 ≥ 8%。
-         代价：URL-safe 无 padding 的 IV（22 位）约 47% 会被这条挡掉；标准 base64
-         （A-Za-z0-9+/=）与 hex 完全不受影响，带 padding 的 URL-safe（24 位）也不受
-         影响（末尾的 '=' 不满足 ^[-_A-Za-z0-9]+$）。已量化，见报告。
+      3. 含 -/_ 且「像词串」：即 kebab / snake / BEM（如 _customer_latitude_cache /
+         at-tab-bar__item / test-passive）。原先这里只看 `[A-Za-z0-9-_]+` 就一律拒绝，
+         代价是 URL-safe 无 padding 的 IV（22 位）约 47% 被误杀 —— 因为随机 base64url
+         里 -/_ 占 2/64 ≈ 3%，22 位里出现的概率约 50%，而其中 100% 都满足那个字符集。
+         现在改由 is_iv_word_token 判「是否真像词串」，同一批随机 IV 的误杀率降到 ~1%
+         （见该函数的说明与实测）。
       4. 驼峰 / 帕斯卡「单词串」：每段是「大写 + ≥2 个小写」的真单词。随机串里
          小写连排的平均长度约 1.5，要求每段 ≥3 字符后 22 位随机 base64 的通过率
          约 1e-4。这正是 noMobileFallback / setEnable1v1Chat / MobileVerifyType
@@ -1655,7 +1791,10 @@ def is_iv_identifier_like(s: str) -> bool:
         return True
     if RE_IV_SCREAMING.match(s):
         return True
-    if ("-" in s or "_" in s) and RE_IV_WORD_TOKEN.match(s):
+    if ("-" in s or "_" in s) and RE_IV_WORD_TOKEN.match(s) and is_iv_word_token(s):
+        return True
+    # 以 '/' 开头的接口路径（/payment/v1/generalPay、/login/authLogin …）
+    if is_iv_path_like(s):
         return True
     if is_word_shaped_identifier(s):
         return True
@@ -1680,6 +1819,70 @@ def is_word_shaped_identifier(s: str) -> bool:
     （AES KEY 允许是纯数字/纯小写/SCREAMING 口令，不能一刀切）。
     """
     return bool(RE_IV_CAMEL_WORDS.match(s) or RE_IV_PASCAL_WORDS.match(s))
+
+
+def is_iv_word_token(s: str) -> bool:
+    """含 -/_ 的值是否「像词串」（CSS 类名 / snake_case / BEM）。
+
+    把 -/_ 当词边界切段，要求「像词的段」覆盖了值的一半以上字符：
+
+      - 段的形状由 RE_IV_WORD_SEG_* 三条规定（小写单词 / 首字母大写单词 / 全大写缩写，
+        都允许尾随数字），或整段是驼峰/帕斯卡词串（is_word_shaped_identifier）。
+      - 段不算词的部分（纯数字、单字母、随机大小写混排）只起拉低覆盖率的作用。
+
+    为什么用「覆盖率」而不是「任意一段是词」：标识符的 -/_ 落在词边界上，两侧都是词，
+    于是覆盖率天然很高（test-passive 100%、_customer_latitude_cache 88%、
+    at-tab-bar__item 63%、0391_FluidR3_GM_sf2_file 38%）；随机 base64url 的 -/_
+    落在随机位置，覆盖率要么是 0（旁边不是词形的段），要么只有一小截。
+
+    连续分隔符 `__` / `--` 是 BEM 的结构特征，随机串出现的概率约 1%，直接判词串。
+
+    实测（20000 个真实 urlsafe_b64encode(os.urandom(16)) 去 padding 的 22 位值，
+    与三库 crypto_static_iv 语料里去重后 5822 个「原规则挡下的值」对比）：
+      - 随机 IV 被这条误杀 ~1.3%（原「一律拒绝」是 ~47%）
+      - 5822 个标识符里仍挡下 ~93%
+      - 标准 base64（含 +/=）没有 -/_，走不到这个分支，行为完全不变
+    """
+    if "__" in s or "--" in s:
+        return True
+    covered = 0
+    for seg in re.split(r"[-_]", s):
+        if not seg:
+            continue
+        if (RE_IV_WORD_SEG_LOWER.fullmatch(seg)
+                or RE_IV_WORD_SEG_CAP.fullmatch(seg)
+                or RE_IV_WORD_SEG_ABBR.fullmatch(seg)
+                or is_word_shaped_identifier(seg)):
+            covered += len(seg)
+    return covered * 2 >= len(s)
+
+
+def is_iv_path_like(s: str) -> bool:
+    """值是否像 URL 接口路径（/seg[/seg]…），而不是随机 IV。
+
+    这是「真接口被判成 IV」那一类误报的身份护栏。三库实测（真实 source_snippet
+    重跑）：84 行 / 21 个值既是「以 / 开头的接口路径」又命中 crypto_static_iv，
+    例如 /payment/v1/generalPay（13 行）、/login/authLogin（24 行）。
+
+    根因：is_iv_identifier_like 原有的 kebab/snake 分支只把 - 和 _ 当词边界，
+    RE_IV_WORD_TOKEN(`^[-_A-Za-z0-9]+$`) 不匹配含 '/' 的值，于是接口路径整批漏过，
+    进到 is_random_iv_value 后逐条通过：
+      - /payment/v1/generalPay 长度 22 ∈ IV_BASE64_LENGTHS；
+      - 字符全在 BASE64_CHARS 内（'/' 也在表里）；
+      - 大小写混排（'P'）。
+    is_static_iv 原有的「含 / 即拒」护栏只拦「结构上不是合法 base64」的值
+    （pages/index/index、/api/v1/user），拦不住长度和字符表都正好合法的接口路径。
+
+    判据复用 is_iv_word_token（把 '/' 也当词边界），所以问的是「段是不是词」而不是
+    「有没有 '/'」，代价用 Monte Carlo 量过（30 万次，见报告）：
+      - 随机 16 字节标准 base64（24 字符）首字符恰好是 '/' 的概率 1/64 = 1.59%，
+        要求「像路径」后误杀降到 0.032%（相差 50 倍）；
+      - base64url（22 字符，- _）与 hex 路径根本不含 '/'，代价恒为 0。
+    实测覆盖 21 个误报值里的 17 个（84 行里的 80 行）；剩余 4 个值见报告。
+    """
+    if not s.startswith("/"):
+        return False
+    return is_iv_word_token(s.replace("/", "-"))
 
 
 def is_random_iv_value(s: str) -> bool:
@@ -1719,10 +1922,16 @@ def _decode_base64_or_none(s: str):
 
 def is_static_iv(s: str, stmt: str) -> bool:
     """检测是否为硬编码 IV"""
-    # 排除路径格式
-    if "/" in s:
+    # 排除路径格式。原先写的是「含 / 即拒」，但标准 base64 的字母表本身就含 /（BASE64_CHARS
+    # 里的 + / 与 - _ 是同一张 64 字符表的两种变体），16 字节 IV 的标准 base64 去 padding
+    # 写法里约 28% 含 /，一律拒绝等于误杀它们。改成只问「结构上是不是合法 base64」：
+    #   pages/index/index  → 长度 17，(-17)%4==3，不是任何字节串的 base64 → 仍拒
+    #   /api/v1/user       → 结构合法，但无大写字母，被 is_random_iv_value 的混排检查拦下
+    #   https://x.com/a    → 长度 15 不进 IV_BASE64_LENGTHS → 仍拒
+    # URL-safe 变体（- _）与 hex 路径不受影响（hex 分支在下面，未改动）。
+    if "/" in s and _decode_base64_or_none(s) is None:
         return False
-    
+
     s_lower = s.lower()
     if has_keyword_substring(s_lower, IV_VALUE_BLACKLIST):
         return False
@@ -1921,6 +2130,17 @@ def is_secret_key(s: str, stmt: str) -> tuple:
         # 排除含 URL/查询串分隔符、连字符、下划线的值
         # （如 UUID4DE47302-EDC7-41D4-888F-59A79DF4EA46、ERROR5_ON_LOGIN_PEER_SECRET_PAGE）
         if not any(c in s for c in "/:@?&=-_"):
+            # 排除日志/报错文案：真实密钥不含空白，而这类句子只因为 512 字符上下文里
+            # 恰好出现 secret 一词就被判成密钥。实测三库语料里仍命中的（修复前 3 值/6 行）：
+            #   "Crypto key must be 32 characters long"
+            #   "the speechRecognizerV2 get url"
+            #   "do not support s3 endpoint, please use tos endpoint."
+            if any(c.isspace() for c in s):
+                return (False, None)
+            # 排除模块/资源文件名：构件名不是密钥
+            # （如 ReactPropTypesSecret = require("68CE51906B707CCF0EA83997ABE78D80.js")）
+            if s.lower().endswith(MINIAPP_MODULE_EXTENSIONS + MINIAPP_ASSET_EXTENSIONS):
+                return (False, None)
             # 排除全大写错误码常量（纯 hex 大写密钥不受影响，避免漏报），
             # 并要求足够的字符多样性以排除低熵噪声
             if not (s.isupper() and not is_hex_string(s)) and has_min_unique_chars(s, 10):
@@ -1986,6 +2206,30 @@ def pii_get_digit_type(s: str) -> str:
 # =========================================================
 # 小程序路径处理
 # =========================================================
+# 小程序页面/分包路由的形态：含 /pages/（覆盖 #/pages/ 写法），或以 /package、/packages/
+# 开头。实测三库 server_url_payment 里这样的值有 622 个：
+#   /GaoDeng/pages/gdPay/main                                  ← "pay" 命中 gdPay
+#   /0WX1XCX/repayment/#/pages/index/index                     ← "pay" 命中 repayment
+#   /TUICallKitAlipay/pages/visitDetail                        ← "pay" 命中 alipay
+#   /packages/pay/unicashier/index
+# 它们经 URL_SENSITIVE_KEYWORDS 的裸子串匹配被判成支付/登录/后台接口，但值本身是
+# 前端页面路由，不是后端端点。
+RE_MINIAPP_PAGE_ROUTE = re.compile(r"/pages/|^/package", re.I)
+
+
+def is_miniapp_page_route(s: str) -> bool:
+    """值是否为小程序页面/分包路由形态（不是后端接口路径）。
+
+    含 API 路径标记（/api/、/v1/、/v2/、/v3/、api/）的值不算页面路由：
+    `/api/v1/pages/list` 里的 "pages" 是 REST 资源名，不是小程序页面目录。
+    实测本次从 server_url_payment 改判的 609 个值（1220 个「值 + 上下文」对）里，
+    含 API 标记的为 0，所以这条排除不损失任何目标值，只是把这类理论误伤挡在门外。
+    """
+    if has_keyword_substring(s.lower(), MINIAPP_API_PATH_PATTERNS):
+        return False
+    return bool(RE_MINIAPP_PAGE_ROUTE.search(s))
+
+
 def url_process_path(rel_path: str) -> str:
     """处理小程序路径类型"""
     s_lower = rel_path.lower()
@@ -2251,6 +2495,12 @@ def process_generic_slash_prefixed_constant(s: str, stmt: str, src: str, sid: in
     # 8. 敏感路径关键字检测 (login/auth/pay/admin 等)
     for keyword, slug_id in URL_SENSITIVE_KEYWORDS.items():
         if keyword in s_lower:
+            # 小程序/H5 页面路由不是后端接口：页面名里的 pay/alipay/repayment/login/
+            # admin 只是路由词，不该被裸子串匹配吞成支付/登录/后台接口（见
+            # is_miniapp_page_route）。
+            if is_miniapp_page_route(s):
+                process_prefixed_miniapp_pages(s, 0, stmt, src, sid, results)
+                return
             append_result(results, slug_id, s, src, sid)
             return
 
@@ -2529,8 +2779,8 @@ def perform_constant_classifying(statements: List[str], constants: List):
             process_analytics_key(s, stmt, src, sid, res)
             continue
 
-        # session key
-        if is_session_key(s):
+        # session key（判据需要语境，必须把 stmt 传进去）
+        if is_session_key(s, stmt):
             process_session_key(s, stmt, src, sid, res)
             continue
 
