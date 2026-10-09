@@ -49,6 +49,41 @@ def has_keyword_substring(stmt: str, keywords: Union[Set[str], Tuple[str, ...]])
     return any(kw in stmt_lower for kw in keywords)
 
 
+# 短关键词（uid / pwd）必须落在「独立词或驼峰段」边界上。
+# has_keyword_in_context 的快速路径是纯子串匹配（`kw in stmt_lower`），对长关键词没问题，
+# 对两个字母级别的短词则过宽：
+#   uid  → uuid / uuids / __uuid__ / guid / guide / skuId / menuId / t2zxNHFUIdE
+#   pwd  → has_paypwd / dmPwD / 随机 base64 载荷里的 "pwd" 子串
+# 因此这两个词不走原函数，改走下面的段匹配（其余关键词行为完全不变）。
+RE_SHORT_KEYWORD_TOKEN = re.compile(r"[A-Za-z0-9$]+")
+UID_LOOKALIKE_SUBSTRINGS = ("uuid", "guid", "guide")
+
+
+def has_keyword_in_context_strict(stmt: str, keyword: str,
+                                  lookalikes: Tuple[str, ...] = ()) -> bool:
+    """判断 keyword 是否以「独立词或驼峰段」形式出现在 stmt 中（大小写不敏感）。
+
+    例: uid 认 o.uid / visitorUid / uidRule / ProductUidL / uid:，
+    不认 uuid / uuids / __uuid__ / guid / mobxGuid / guide / skuId / t2zxNHFUIdE。
+    lookalikes 给出该短词的同形家族子串（如 uuid/guid/guide），命中即整段跳过。
+
+    断词规则与 has_keyword_in_context 的慢速路径一致（小写/数字接大写处断开），
+    另外把 `_ - . : " '` 与其它非标识符字符当作分隔符。
+    已知漏报形态：全大写段紧接另一个大写开头单词的写法不算段，例如
+    getUIDByUser（无小写→大写断点）不命中；getUidByUser / uidRule / UID 命中。
+    """
+    if not stmt:
+        return False
+    kw = keyword.lower()
+    for token in RE_SHORT_KEYWORD_TOKEN.findall(stmt):
+        token_lower = token.lower()
+        if any(lk in token_lower for lk in lookalikes):
+            continue
+        if kw in re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", token).lower().split():
+            return True
+    return False
+
+
 # =========================================================
 # 通用验证函数 (提高复用率)
 # =========================================================
@@ -367,6 +402,26 @@ USER_ID_KEYWORDS = {
     "companyid", "company_id",
 }
 
+
+def has_user_id_context(stmt: str) -> bool:
+    """USER_ID_KEYWORDS 的上下文判定：uid 收紧为「独立词/驼峰段」，其余关键词不变。
+
+    uid 走 has_keyword_in_context_strict —— 裸子串会让 uuid / guid / skuId / menuId
+    等一并命中 id_user_identifier；userid / openid / account_id 等长关键词仍走原函数。
+    """
+    return (has_keyword_in_context_strict(stmt, "uid", UID_LOOKALIKE_SUBSTRINGS)
+            or has_keyword_in_context(stmt, USER_ID_KEYWORDS - {"uid"}))
+
+
+def has_cloud_password_context(stmt: str) -> bool:
+    """CLOUD_PASSWORD_CONTEXT_WORDS 的上下文判定：pwd 收紧为「独立词/驼峰段」，其余不变。
+
+    pwd 走 has_keyword_in_context_strict —— 裸子串会让 has_paypwd / dmPwD /
+    base64 随机载荷中的 "pwd" 命中；password / passwd / db_pwd 等仍走原函数。
+    """
+    return (has_keyword_in_context_strict(stmt, "pwd")
+            or has_keyword_in_context(stmt, CLOUD_PASSWORD_CONTEXT_WORDS - {"pwd"}))
+
 ORDER_ID_KEYWORDS = {
     "orderid", "order_id", "orderno", "order_no",
     "transactionid", "transaction_id", "tradeno", "trade_no",
@@ -375,6 +430,9 @@ ORDER_ID_KEYWORDS = {
 VALID_DEVICE_ID_LENGTHS = {12, 15, 16, 32, 36}
 
 IV_CONTEXT_KEYWORDS = {"iv", "nonce", "vector", "sm4iv", "sm4_iv"}
+# 除 `iv` 以外的关键词仍是朴素小写子串匹配（nonce / vector / sm4_iv / sm4iv 都是
+# 长词，且 sm4iv / sm4_iv 还要兜住 SM4IV 这种全大写写法）。`iv` 单独走 RE_IV_CONTEXT。
+IV_CONTEXT_SUBSTR_KEYWORDS = tuple(sorted(IV_CONTEXT_KEYWORDS - {"iv"}))
 AES_KEY_CONTEXT_KEYWORDS = {
     "aeskey", "aes_key", "encryptkey", "encrypt_key",
     "deskey", "des_key", "sm4key", "sm4_key",
@@ -383,6 +441,31 @@ AES_KEY_CONTEXT_KEYWORDS = {
 IV_HEX_LENGTHS = (16, 24, 32)
 IV_BASE64_LENGTHS = (12, 16, 22, 24)
 IV_STR_LENGTHS = (8, 12, 16)
+
+# ---------------------------------------------------------
+# 硬编码 IV / AES KEY 的值形态守卫（标识符不是密钥）
+# ---------------------------------------------------------
+# IV 的 base64/字符串两条路径原先只看「长度 + 字符集」，长度 12/16 与字符集
+# A-Za-z0-9+/=-_ 太宽，于是「标识符形态」的值（CSS 类名 / 变量名 / 常量名）
+# 全部漏进 crypto_static_iv：
+#   test-passive / custom-class / tab-active-class       → CSS 类名（kebab）
+#   _customer_latitude_cache / class_detail / pay_share_id → snake_case
+#   DISCOUNT / THEME_CLASS_NAME / BEFORE_THE_TITLE       → SCREAMING_SNAKE
+#   noMobileFallback / setEnable1v1Chat                  → 驼峰标识符
+#   des-ede3-cbc                                         → 算法名（外形也是 kebab 词串）
+# 唯一能通过原检查的身份护栏是 `s.islower() and s.isalpha()`，它挡不住混合大小写、
+# 驼峰、以及含 -/_ 的标识符。is_static_aes_key 同样只按「长度 + isalnum」放行，
+# 于是 aesKey 上下文里的变量名（noMobileFallback / setEnable1v1Chat /
+# MobileVerifyType）也被判成 crypto_static_iv，所以它也复用这里的词形判据。
+#
+# 逐条排除的「词」特征，代价在 test-result/iv-fix/ 用 3 个真库语料 + 模拟真实 IV 量化：
+#   1) 纯数字 / 全大写 / SCREAMING_SNAKE —— 随机字节串的概率 < 1e-3
+#   2) 含 -/_ 的纯词串（[A-Za-z0-9-_]）—— 见 is_iv_identifier_like 的说明
+#   3) 驼峰 / 帕斯卡单词串 —— 每段是「大写 + ≥2 个小写」的真单词（见下方说明）
+RE_IV_WORD_TOKEN = re.compile(r"^[-_A-Za-z0-9]+$")
+RE_IV_SCREAMING = re.compile(r"^[A-Z0-9]+(?:_[A-Z0-9]+)*$")
+RE_IV_CAMEL_WORDS = re.compile(r"^[a-z0-9]+(?:[A-Z][a-z]{2,}[a-z0-9]*)+$")
+RE_IV_PASCAL_WORDS = re.compile(r"^[A-Z][a-z]{2,}[a-z0-9]*(?:[A-Z][a-z]{2,}[a-z0-9]*)+$")
 
 IV_VALUE_BLACKLIST = (
     "enterkeyhint", "controlslist", "autocomplete", "hreflang", "datetime",
@@ -736,6 +819,23 @@ def url_is_query(s: str) -> bool:
 # =========================================================
 # Bucket 名称检测
 # =========================================================
+def is_cloud_region_value(s: str) -> bool:
+    """判断值是否形如云区域名 (cn-southwest / ap-shanghai / us-east-1 / cn-north)。
+
+    条件与原 process_generic_alpha_prefixed_constant 里的区域判定完全一致，抽出来共用：
+    COS 模板语句里 {{Region}} 与 {{Bucket}} 并存，而 is_bucket_name 在主链上先于区域
+    判定运行，会把区域名吞成桶名（cn-southwest → cloud_bucket_name），所以桶判定必须
+    显式给区域形态的值让路。
+    """
+    if not s:
+        return False
+    s_lower = s.lower()
+    for prefix in CLOUD_REGION_PREFIX_WORDS:
+        if s_lower.startswith(prefix):
+            return len(s) < 30 and "/" not in s and "." not in s
+    return False
+
+
 def is_bucket_name(s: str, stmt: str) -> bool:
     """检测是否为云存储桶名称"""
     if not has_keyword_substring(stmt, BUCKET_CONTEXT_WORDS):
@@ -752,6 +852,10 @@ def is_bucket_name(s: str, stmt: str) -> bool:
 
     # 语义黑名单
     if has_keyword_substring(s_lower, BUCKET_VALUE_BLACKLIST):
+        return False
+
+    # 区域形态的值是区域名，不是桶名（让位给更具体的区域判定）
+    if is_cloud_region_value(s):
         return False
 
     # 结构复杂度: 必须包含 '-' 或数字
@@ -1214,7 +1318,7 @@ def is_identifier(s: str, stmt: str) -> tuple:
             return (True, IDT.ID_DEVICE_IDENTIFIER)
         if has_keyword_in_context(stmt, AD_ID_KEYWORDS):
             return (True, IDT.ID_AD_IDENTIFIER)
-        if has_keyword_in_context(stmt, USER_ID_KEYWORDS):
+        if has_user_id_context(stmt):
             return (True, IDT.ID_USER_IDENTIFIER)
         if has_keyword_in_context(stmt, ORDER_ID_KEYWORDS):
             return (True, IDT.ID_ORDER_IDENTIFIER)
@@ -1228,7 +1332,7 @@ def is_identifier(s: str, stmt: str) -> tuple:
         if s_len in VALID_DEVICE_ID_LENGTHS and s.isalnum():
             return (True, IDT.ID_AD_IDENTIFIER)
 
-    if has_keyword_in_context(stmt, USER_ID_KEYWORDS):
+    if has_user_id_context(stmt):
         if check_length_range(s, 8, 64) and (s.isdigit() or s.isalnum()):
             # 排除纯小写字母的常见命名模式（页面名、事件名等）
             if s.islower() and s.isalpha():
@@ -1371,7 +1475,7 @@ def process_server_cookie(s: str, stmt: str, src: str, sid: int, res: list):
 # =========================================================
 def is_cloud_password(s: str, stmt: str) -> bool:
     """检测是否为云服务密码明文"""
-    if not has_keyword_in_context(stmt, CLOUD_PASSWORD_CONTEXT_WORDS):
+    if not has_cloud_password_context(stmt):
         return False
     if not check_length_range(s, 6, 64):
         return False
@@ -1404,6 +1508,11 @@ def is_cloud_password(s: str, stmt: str) -> bool:
                     "text-align", "position:", "width:", "height:", "margin",
                     "padding", "border", "font-", ",.")
     if has_keyword_substring(s_lower, css_keywords):
+        return False
+    # 排除 CSS 声明形态的值 (display:none / overflow:hidden / model:value)：
+    # 这类语句里常另有 pwdStyle / pwdInput 之类「合法的」pwd 段，word 边界匹配拦不住，
+    # 只能按值形拦 —— 密码明文不会长成「全小写属性:全小写值」。
+    if re.match(r'^[a-z-]+:[a-z-]+$', s_lower):
         return False
     if re.match(r'^[a-z]+-[a-z]+-[a-z]+-\d+', s_lower):
         return False
@@ -1467,15 +1576,145 @@ def process_miniapp_api_params(s: str, stmt: str, src: str, sid: int, res: list)
 # =========================================================
 # 硬编码 IV/KEY 检测
 # =========================================================
+# `iv` 只有两个字母，原来的小写子串匹配会让 div / give / active / relative /
+# driver / private / deliver / divider / lively / activity / native ... 里的 `iv`
+# 建立「IV 上下文」——`<div class="test-passive">` 一条语句就够。语句里任何 IV 形态
+# 的值都会因此被判成 crypto_static_iv(2104)，所以 `iv` 不能再用子串匹配。
+#
+# 收紧方向和上一轮的值形态修复相反：判紧了会真的漏掉 IV，所以判据必须覆盖真实写法。
+# 现实里 `iv` 作为独立语义单元出现只有两种外形：
+#   1. 独立词 / 分隔词：`iv` `IV` `Iv`、`iv:` `iv=` `iv,`、`aes_iv`、`options.iv`、
+#      `iv_key`、`iv="..."`、`{iv}` —— `i` 前一个字符不是字母数字（标识符起点或分隔符）；
+#   2. 驼峰段：`aesIv` `sm4Iv` `staticIv` `aesIV`、`IvValue` —— 大写 `I` 前面是小写
+#      字母或数字（`4I` 也算，`,sm4Iv` 要命中）。
+# 两条都要求 `v` 后面不是小写字母：`ivStr` / `ivKey2` / `IvValue` 命中，而英语词里的
+# `iv`（后面几乎总是元音：active / relative / divider / activity / give）落空。
+#
+# 反例一侧的证据（6001 个真实文件采样，脚本与语料见 test-result/iv-context/）：
+#   - 小写 `iv` 前面是小写字母的一律不算：div（_div / divRemTo / "div-xxx"）、give、
+#     active、relative、driver、private、deliver、divider、lively 全部落空；
+#   - 全大写词里的 `IV` 若前面还是大写字母也不算：ACTIVITY / RECEIVE / DELIVERY /
+#     PRIVACY / NEGATIVE / POSITIVE / DIV 这类 SCREAMING_SNAKE 落空（这是 `iv` 误命中的
+#     另一大来源，`A[Ii][Vv](?![a-z])` 这种写法会把它全放进来）。
+#     代价：`AESIV` / `KEYIV` 这种「全大写下 `IV` 直接贴在字母后面」的写法会漏掉。
+#     真实采样里 0 出现；且 AES_IV / aesIv / sm4Iv / SM4IV（后者由 sm4iv 关键词兜底）
+#     仍然命中。若日后真出现 AESIV 写法，应作为关键词补进 IV_CONTEXT_KEYWORDS，
+#     而不是放宽这条正则。
+#   - 小写 `iv` 在词中、后面跟大写的写法（aesivKey / divClass 一类）同样不算：采样里
+#     89 次出现全部是 base64 乱码或 divRemTo，没有任何真 IV，故不为此放宽。
+#   - 唯一需要靠「对的大小写」挡掉的是 `iVB`：base64 PNG 前缀 iVBORw0KGgo... 就是
+#     「词首 iV」，所以词首分支只接受 iv / Iv / IV 三种拼法，不接受 iV。
+RE_IV_CONTEXT = re.compile(r"(?<![0-9A-Za-z])(?:iv|Iv|IV)(?![a-z])"
+                           r"|(?<=[a-z0-9])I[Vv](?![a-z])")
+
+
 def has_iv_context(stmt: str, value: str = "") -> bool:
-    """判断上下文是否包含 IV 含义"""
+    """判断上下文是否包含 IV 含义。
+
+    先把值本身从语句里剔除（值自己可能含 `iv`，不能由它建立上下文），再判断：
+      - `iv` 走 RE_IV_CONTEXT 的「词边界 / 驼峰段」匹配（在**原始大小写**上判断，
+        因为小写化后就分不出 aesIv 和 div 了）；
+      - 其余关键词仍是原来的小写子串匹配，行为不变。
+    """
     context_only = stmt.replace(value, "") if value and value in stmt else stmt
-    return has_keyword_substring(context_only.lower(), IV_CONTEXT_KEYWORDS)
+    if not context_only:
+        return False
+    if RE_IV_CONTEXT.search(context_only):
+        return True
+    context_lower = context_only.lower()
+    return any(kw in context_lower for kw in IV_CONTEXT_SUBSTR_KEYWORDS)
 
 
 def has_aes_key_context(stmt: str) -> bool:
     """判断上下文是否包含 AES_KEY 含义"""
     return has_keyword_in_context(stmt, AES_KEY_CONTEXT_KEYWORDS)
+
+
+def is_iv_identifier_like(s: str) -> bool:
+    """判断值是否为「标识符/词」形态（CSS 类名、变量名、常量名、算法名）。
+
+    这是 is_static_iv 在 base64/字符串两条路径上的身份护栏：真实 IV 是随机字节，
+    不是词。每条判据都要求「分词」特征，随机串几乎不可能满足：
+
+      1. 纯数字：12 位随机 base64 全为数字的概率 (10/64)^12 ≈ 1e-10
+      2. SCREAMING_SNAKE / 全大写：22 位随机 base64 全在 [A-Z0-9_] 内 ≈ 1e-6
+      3. 含 -/_ 且其余字符是字母数字：即 kebab / snake / BEM（含首尾、连续分隔符，
+         如 _customer_latitude_cache / at-tab-bar__item / isEnterPictureInPicture-）。
+         随机 base64 里 -/_ 只占 2/64 ≈ 3%，而标识符里它们是词边界，占比 ≥ 8%。
+         代价：URL-safe 无 padding 的 IV（22 位）约 47% 会被这条挡掉；标准 base64
+         （A-Za-z0-9+/=）与 hex 完全不受影响，带 padding 的 URL-safe（24 位）也不受
+         影响（末尾的 '=' 不满足 ^[-_A-Za-z0-9]+$）。已量化，见报告。
+      4. 驼峰 / 帕斯卡「单词串」：每段是「大写 + ≥2 个小写」的真单词。随机串里
+         小写连排的平均长度约 1.5，要求每段 ≥3 字符后 22 位随机 base64 的通过率
+         约 1e-4。这正是 noMobileFallback / setEnable1v1Chat / MobileVerifyType
+         被挡住的原因；而手写的示例 IV（AbCdEfGhIjKlMnOp 这类每段只有 1 个小写）
+         不会被挡。
+      5. 纯小写字母（原有护栏，保留）
+    """
+    if s.isdigit():
+        return True
+    if RE_IV_SCREAMING.match(s):
+        return True
+    if ("-" in s or "_" in s) and RE_IV_WORD_TOKEN.match(s):
+        return True
+    if is_word_shaped_identifier(s):
+        return True
+    if s.isalpha() and s.islower():
+        return True
+    return False
+
+
+def is_word_shaped_identifier(s: str) -> bool:
+    """值是否是「驼峰 / 帕斯卡单词串」——每段是「大写 + ≥2 个小写」的真单词。
+
+    这是最保守的一条标识符判据：要求每个大写字母后面至少跟 2 个小写字母，
+    即必须能切成真单词（Mobile / Verify / Type、no / Mobile / Fallback），
+    而不是靠大小写切换凑出来的随机串。
+
+      - 随机 22 位 base64 的通过率约 1e-4（随机串里小写连排平均长度 ≈ 1.5）；
+      - 手写示例 IV（AbCdEfGhIjKlMnOp 这类每段只有 1 个小写）不会被挡；
+      - 变量名/组件名（noMobileFallback / setEnable1v1Chat / MobileVerifyType /
+        BeforeGetUserPhoneNumber）会被挡。
+
+    is_static_iv 用它之外还叠了别的规则；is_static_aes_key 只用了这一条
+    （AES KEY 允许是纯数字/纯小写/SCREAMING 口令，不能一刀切）。
+    """
+    return bool(RE_IV_CAMEL_WORDS.match(s) or RE_IV_PASCAL_WORDS.match(s))
+
+
+def is_random_iv_value(s: str) -> bool:
+    """base64 / 字符串两条路径共用的值形态校验。
+
+    要求值「不是词、大小写混排、结构上是合法 base64」：
+
+      - 词形态由 is_iv_identifier_like 排除（本次修复的主体）。
+      - 大小写混排：真实 IV 是随机字节，base64 编码后必然大小写混排；
+        22 位随机 base64 里完全没有大写（或完全没有小写）的概率约 4e-5。
+      - 结构校验：随机字节的 base64 一定可解码。'=' 出现在中间的值不是合法
+        base64（例如 targetItem====== / =====getUserProfile=====），也不是 IV。
+
+    未采用「解码后必须是非可打印字节」这条更强的随机性判据：它会把
+    「base64 包了一层明文 IV」的值一并砍掉（真实语料里就有
+    MTIzNDU2NzgxMjM0NTY3OA== → '1234567812345678'、I3Jla2xhbWk= → 'reklami'），
+    按「宁可漏报少一点」的方向放弃，详见报告。
+    """
+    if is_iv_identifier_like(s):
+        return False
+    if not (any(c.isupper() for c in s) and any(c.islower() for c in s)):
+        return False
+    return _decode_base64_or_none(s) is not None
+
+
+def _decode_base64_or_none(s: str):
+    """按 base64 / base64url 解码，非法结构返回 None（不抛异常）。"""
+    normalized = s.replace("-", "+").replace("_", "/")
+    pad = (-len(normalized)) % 4
+    if pad == 3:  # 4n+1 长度不是任何字节串的 base64
+        return None
+    try:
+        return base64.b64decode(normalized + "=" * pad, validate=True)
+    except (ValueError, TypeError):
+        return None
 
 
 def is_static_iv(s: str, stmt: str) -> bool:
@@ -1492,16 +1731,14 @@ def is_static_iv(s: str, stmt: str) -> bool:
 
     length = len(s)
 
+    # hex 路径保持原样：16/24/32 位 hex 正是 IV 的标准形态（32 位 = AES 16 字节 IV），
+    # 随机 hex 判得准，不做任何收紧。
     if length in IV_HEX_LENGTHS and is_hex_string(s):
         return True
     if length in IV_BASE64_LENGTHS and is_base64_chars(s):
-        if s.islower() and s.isalpha():
-            return False
-        return True
+        return is_random_iv_value(s)
     if length in IV_STR_LENGTHS and s.isalnum():
-        if s.islower() and s.isalpha():
-            return False
-        return True
+        return is_random_iv_value(s)
 
     return False
 
@@ -1512,10 +1749,16 @@ def is_static_aes_key(s: str, stmt: str) -> bool:
         return False
 
     length = len(s)
-    if length in (16, 24, 32) and s.isalnum():
-        return True
+    # hex 形态先判：32/48/64 位 hex 未受影响
     if length in (32, 48, 64) and is_hex_string(s):
         return True
+    if length in (16, 24, 32) and s.isalnum():
+        # 只挡「驼峰/帕斯卡单词串」这一种标识符形态（aesKey: "noMobileFallback" /
+        # "setEnable1v1Chat" / "MobileVerifyType" 这类变量名被当成 AES KEY）。
+        # 密钥本身常见的形态全部保留：纯数字口令(1234567890123456)、
+        # 纯小写口令(abcdefghijklmnop)、SCREAMING(MYAESKEY12345678)、
+        # 随机混合串(EpdnnX4MBpPjdlsZ)，都仍然命中。
+        return not is_word_shaped_identifier(s)
 
     return False
 
@@ -1576,13 +1819,50 @@ def has_secret_context(stmt: str) -> bool:
     return has_keyword_in_context(stmt, APP_SECRET_CONTEXT_WORDS)
 
 
+def is_access_token_format(s: str) -> bool:
+    """AccessToken 值的格式校验（字母开头 / 数字开头两条路径共用同一套）
+
+    只接受“像 token”的值：
+      - 长度 >= 20（真实 OAuth/JWT token 远长于此）
+      - 字母与数字混合
+      - 不含路径/表达式/日期/URL 查询类分隔符（, ; : . / @ ? & = 等）
+      - 排除驼峰标识符（如 getUserInfo2）
+    真实 token 常见形态为 alnum 或 base64url（A-Za-z0-9-_）。
+
+    关于排除 '.'：JWT 以 eyJ 开头，在更早的 TOKEN_PREFIX_WORDS 分支
+    （process_generic_alpha_prefixed_constant，先于本函数的调用点）就被接住，
+    且 JWT 不可能数字开头，因此这里排除 '.' 不会漏掉 JWT。
+    """
+    if len(s) < 20:
+        return False
+    if s.isdigit():
+        return False
+    if not any(c.isalpha() for c in s) or not any(c.isdigit() for c in s):
+        return False
+    if not has_min_unique_chars(s, 4):
+        return False
+    if any(c in s for c in ",;:./@?&=#!*()[]{}'\"\\|<> \t\n\r"):
+        return False
+    if s[0].islower() and any(c.isupper() for c in s):
+        return False
+    return True
+
+
 def is_app_key(s: str, stmt: str) -> tuple:
     """检测是否为 AppKey/ApiKey，返回 (是否匹配, 分类ID)"""
     if not has_appkey_context(stmt):
         return (False, None)
-    if not check_length_range(s, 10, 40) or s.isdigit():
+    # 长度下限从 10 提到 16，排除 d5f5e1f6b0 之类的短噪声
+    if not check_length_range(s, 16, 40) or s.isdigit():
         return (False, None)
     if not is_alnum_extended(s) or not any(c.isalpha() for c in s):
+        return (False, None)
+    # 排除含连字符/下划线的值（如 data-v-79e6a490、错误码常量）
+    if "-" in s or "_" in s:
+        return (False, None)
+    # 排除全大写的错误码常量（如 ERROR5_ON_LOGIN_PEER_SECRET_PAGE），
+    # 但纯 hex 值（如大写 AppSecret）不受影响，避免漏报
+    if s.isupper() and not is_hex_string(s):
         return (False, None)
     # 排除纯小写字母（变量名/页面名，如 editaccount, presuccess）
     if s.islower() and s.isalpha():
@@ -1592,6 +1872,9 @@ def is_app_key(s: str, stmt: str) -> tuple:
         return (False, None)
     # 要求包含数字（真正的 API Key 几乎都有数字）
     if not any(c.isdigit() for c in s):
+        return (False, None)
+    # 要求足够的字符多样性，排除低熵噪声（如 f8a69f1719916z，16位仅8个不同字符）
+    if not has_min_unique_chars(s, 10):
         return (False, None)
     return (True, IDT.PLATFORM_APP_SECRET)
 
@@ -1614,7 +1897,12 @@ def is_secret_key(s: str, stmt: str) -> tuple:
 
     if s.endswith("=="):
         if "clientsecret" in stmt_lower or "client_secret" in stmt_lower:
-            if check_length_range(s, 16, 64):
+            # base64 padding 结尾：要求 base64 字符集、字母+数字混合、字符多样性足够。
+            # 不再排除全大写：'==' 结尾使 is_hex_string 恒为 False，那条会退化成
+            # “排除全大写”而漏掉全大写 base64 密钥；低熵噪声由多样性阈值拦住。
+            if (check_length_range(s, 16, 64) and is_base64_chars(s)
+                    and any(c.isalpha() for c in s) and any(c.isdigit() for c in s)
+                    and has_min_unique_chars(s, 10)):
                 return (True, IDT.PLATFORM_APP_SECRET)
         return (False, None)
 
@@ -1630,8 +1918,13 @@ def is_secret_key(s: str, stmt: str) -> tuple:
         return (True, IDT.PLATFORM_APP_SECRET)
     # 类型 C: 24-64位 混合字符 (API Key) - 放宽下限从32到24
     if 24 <= length <= 64 and has_letter and has_digit:
-        if not any(c in s for c in "/:@?&="):
-            return (True, IDT.PLATFORM_APP_SECRET)
+        # 排除含 URL/查询串分隔符、连字符、下划线的值
+        # （如 UUID4DE47302-EDC7-41D4-888F-59A79DF4EA46、ERROR5_ON_LOGIN_PEER_SECRET_PAGE）
+        if not any(c in s for c in "/:@?&=-_"):
+            # 排除全大写错误码常量（纯 hex 大写密钥不受影响，避免漏报），
+            # 并要求足够的字符多样性以排除低熵噪声
+            if not (s.isupper() and not is_hex_string(s)) and has_min_unique_chars(s, 10):
+                return (True, IDT.PLATFORM_APP_SECRET)
 
     return (False, None)
 
@@ -1814,10 +2107,20 @@ def process_generic_digit_prefixed_constant(s: str, stmt: str, src: str, sid: in
             # 排除路径格式
             if "/" in s:
                 continue
-            # 对于凭证类型，纯数字不应该被分类
+            # 凭证类型：纯数字不分类
             if slug_id in (IDT.PLATFORM_APP_SECRET, IDT.PLATFORM_ACCESS_TOKEN,
                            IDT.PLATFORM_SESSION_KEY, IDT.SERVER_CRED_PASSWORD):
-                continue
+                if s.isdigit():
+                    continue
+                if slug_id == IDT.PLATFORM_ACCESS_TOKEN:
+                    # ACCESS_TOKEN 是这 4 种里唯一只有本分支能判的类型
+                    if not is_access_token_format(s):
+                        continue
+                else:
+                    # APP_SECRET/SESSION_KEY/PASSWORD 不在此判定：它们已分别由更早的
+                    # is_secret_key(L2135)/is_session_key(L2185)/is_cloud_password(L2202)
+                    # 覆盖，而那些检查对同一 (s, stmt) 结果确定，此处再判恒为 False。
+                    continue
             append_result(res, slug_id, s, src, sid)
             return
 
@@ -1867,12 +2170,9 @@ def process_generic_alpha_prefixed_constant(s: str, stmt: str, src: str, sid: in
         return
 
     # 云区域标识
-    for prefix in CLOUD_REGION_PREFIX_WORDS:
-        if s_lower.startswith(prefix):
-            if len(s) < 30 and "/" not in s and "." not in s:
-                append_result(res, IDT.CLOUD_REGION, s, src, sid)
-                return
-            break
+    if is_cloud_region_value(s):
+        append_result(res, IDT.CLOUD_REGION, s, src, sid)
+        return
 
     # 查询字符串
     if url_is_query(s):
@@ -1886,22 +2186,15 @@ def process_generic_alpha_prefixed_constant(s: str, stmt: str, src: str, sid: in
             # 排除路径格式的值 (包含 / 的通常是 API 路径而非凭证)
             if "/" in s:
                 continue
-            # 对于 appsecret 和 access_token，做简单格式验证
-            if slug_id in (IDT.PLATFORM_APP_SECRET, IDT.PLATFORM_ACCESS_TOKEN):
-                # 长度不少于 10
-                if len(s) < 10:
+            # appsecret 复用收紧后的判定，避免 appSecret 上下文绕过
+            # is_secret_key/is_app_key（stmt 含 appsecret/app_secret，
+            # 二者都在 APP_SECRET_CONTEXT_WORDS 中，has_secret_context 为 True）
+            if slug_id == IDT.PLATFORM_APP_SECRET:
+                if not is_secret_key(s, stmt)[0]:
                     continue
-                # 不能是纯数字
-                if s.isdigit():
-                    continue
-                # 香农熵不能太低 (去重字符数 >= 4)
-                if not has_min_unique_chars(s, 4):
-                    continue
-                # 排除纯小写字母（变量名/函数名）
-                if s.islower() and s.isalpha():
-                    continue
-                # 排除驼峰命名模式（如 pageMyPhoneAuth, liveBindPhone）
-                if s[0].islower() and any(c.isupper() for c in s):
+            elif slug_id == IDT.PLATFORM_ACCESS_TOKEN:
+                # 原有宽松规则（抽成 is_access_token_format，数字开头分支复用同一套）
+                if not is_access_token_format(s):
                     continue
             append_result(res, slug_id, s, src, sid)
             return
@@ -1981,6 +2274,73 @@ def process_generic_unknown_constant(s: str, stmt: str, src: str, sid: int, res:
 
 
 # =========================================================
+# 前端框架/构建产物标记（结构性拦截）
+# =========================================================
+# Vue scoped CSS：Vue 编译 SFC 时给每个组件生成一个 hash，DOM 元素上挂
+# data-v-<hash> 属性，配套 CSS 选择器 [data-v-<hash>]。uni-app / Taro 编译到
+# 小程序后同样保留。它是编译产物，永远不是密钥。
+#
+# 不拦这些标记时，同一个 data-v-10bfb526 会被判成 cloud_cred_password(5)、
+# platform_app_secret(5)、platform_access_token(5)、payment_pay_sign(4)、
+# payment_request_params(3)、payment_sign_type(1)、saas_analytics_key(1) ——
+# 7 个互不相干的类型，逐个给判定函数打补丁既漏又不收敛。因此在分类链最前面
+# 统一拦截，一次覆盖全部受影响类型。
+#
+# 归入 other(9901)：
+#   1) 与既有 __scopeId -> other 的处理一致，同一个 __scopeId 家族不会因为
+#      值里多了 data-v-<hash> 就被拆进两个桶；
+#   2) 框架产物不是个人信息，放 pii_noise(2304) 会污染 PII 分类的语义。
+# 不丢弃：命中后仍 append_result，值本身照常入库（只是 risk=0），便于回溯。
+VUE_SCOPE_HEX = r"[0-9a-f]{6,10}"
+# 裸 scope 标记: data-v-10bfb526
+RE_FW_VUE_SCOPE_BARE = re.compile(rf"^data-v-{VUE_SCOPE_HEX}$")
+# 逗号/分号接组件名: data-v-d23bceb8,wx-video. / data-v-b62b882e,wx-view.
+RE_FW_VUE_SCOPE_LIST = re.compile(rf"^data-v-{VUE_SCOPE_HEX}[,;]")
+# 类名 + scope 复合（值以 data-v-<hash> 结尾、且紧邻前置字符是空格或下划线）:
+#   secretFree data-v-3db3bba7
+#   secret-pr-textarea _div data-v-973c8bc8
+RE_FW_VUE_SCOPE_COMPOSITE = re.compile(rf"^.+[ _]data-v-{VUE_SCOPE_HEX}$")
+# Vue 模板指令: v-bind:title.once / v-bind:descript.sync / v-on:confirm / v-model / v-if
+# else-if 放在 else 之前，避免 "v-else-if" 先匹配到 else 再卡在 '-' 上
+RE_FW_VUE_DIRECTIVE = re.compile(
+    r"^v-(?:bind|on|if|else-if|else|for|model|show|html|text|slot|cloak|once|pre)(?:[:.]|$)"
+)
+# WXML 属性命名空间前缀：wx:if / wx:for / wx:key / wx:scope-data / wx:for-item。
+# 出处是平台运行时 page-frame.html（微信小程序页面框架，非业务代码）：
+#   if(e.tag=="wx-wx-scope"){e.tag="virtual";e.wxCkey="11";
+#      e["wxScopeData"]=e.attr["wx:scope-data"]; ...}
+# 属性名在这儿以字符串形式进了运行时，被当成常量提取出来；模板属性名永远不是密钥。
+# 只认「冒号」形态，且属性名必须全小写（WXML 规范）：
+#   wx.request 是 API 调用（点号）、wx-video 是内置组件名（连字符），都不匹配。
+RE_FW_WXML_ATTR = re.compile(r"^wx:[a-z][a-z0-9-]*$")
+
+
+def is_framework_artifact(s: str) -> bool:
+    """判断是否为前端框架/构建产物标记（编译产物，不可能是凭证）。
+
+    覆盖 Vue scoped CSS 的 data-v-<hash> 家族、Vue 模板指令、WXML 的 wx: 属性名。
+
+    廉价预过滤后再上正则：
+      - data-v-<hash> 三兄弟（裸/逗号/复合）都含子串 "data-v-"；
+        复合形态的值以任意类名开头（如 secretFree），不能按首字符过滤，
+        这里必须用子串判断，否则 secretFree data-v-3db3bba7 会被漏掉。
+      - Vue 模板指令以 "v-" 开头。
+      - WXML 属性名以 "wx:" 开头（wx:scope-data 原先被判成 cloud_cred_password(5)）。
+    """
+    if "data-v-" in s:
+        return bool(
+            RE_FW_VUE_SCOPE_BARE.match(s)
+            or RE_FW_VUE_SCOPE_LIST.match(s)
+            or RE_FW_VUE_SCOPE_COMPOSITE.match(s)
+        )
+    if s.startswith("v-"):
+        return bool(RE_FW_VUE_DIRECTIVE.match(s))
+    if s.startswith("wx:"):
+        return bool(RE_FW_WXML_ATTR.match(s))
+    return False
+
+
+# =========================================================
 # 主分类函数
 # =========================================================
 def perform_constant_classifying(statements: List[str], constants: List):
@@ -2001,6 +2361,16 @@ def perform_constant_classifying(statements: List[str], constants: List):
 
         consumed = False
         s_lower = s.lower()
+
+        # =========================================================
+        # 框架/构建产物标记（结构性拦截，必须早于所有类型判定）
+        # =========================================================
+        # data-v-<hash> 会被 is_cloud_password / is_secret_key / is_payment_param /
+        # is_analytics_key 等多个互不相干的判定函数各自误伤，且误判结果随上下文
+        # 漂移。在这里一次性拦掉，比逐个补 7 个判定函数更收敛。
+        if is_framework_artifact(s):
+            append_result(res, IDT.OTHER, s, src, sid)
+            continue
 
         # =========================================================
         # 高频类型优先检测
