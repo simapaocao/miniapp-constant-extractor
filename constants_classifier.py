@@ -750,9 +750,11 @@ def process_Regex_crypto_key(s: str, stmt: str, src: str, sid: int, res: list, r
 # 不是接口端点。三库实测 16 个去重值 / 11174 行，引用次数畸高
 # （"http://www.w3.org/2000/svg" 单个值 3696 行），会把 server_url_api_plain 里
 # 按「出现次数」做的统计带偏。
-# 归到 other，与 is_framework_artifact（data-v-<hash> / wx: 属性）同一思路：
-# 协议/框架产物不是业务常量。不放进 server_url_noise —— 后者在 process_prefixed_url
-# 里的含义是「没有 host 的退化 URL」，命名空间 URL 形态完好，混进去会模糊那个信号。
+# 归到 other：协议常量不是业务端点，但也不该被当成噪音丢掉 —— 它形态完好、
+# 会被 biz 误当接口读，留在库里便于回溯。本次只改注释不动行为：is_framework_artifact
+# 已改为「命中即丢弃」，两者口径从此不同（那边是编译产物、且量级上万；这边 16 个值）。
+# 不放进 server_url_noise —— 后者在 process_prefixed_url 里的含义是「没有 host 的
+# 退化 URL」，命名空间 URL 形态完好，混进去会模糊那个信号。
 RE_W3C_NAMESPACE_URL = re.compile(r"^https?://www\.w3\.org(?:/|$)", re.I)
 
 
@@ -1261,11 +1263,50 @@ def process_session_key(s: str, stmt: str, src: str, sid: int, res: list):
 # =========================================================
 # Hex Token 检测
 # =========================================================
+# MongoDB ObjectID：24 位 hex = 4 字节秒级时间戳 + 5 字节随机 + 3 字节自增计数器，
+# 前 8 个 hex 字符就是 Unix 秒时间戳。
+#
+# 证据（新库 unlist_icp_filing_v2 真实语料）：
+#   ① server_cred_session_key(1603, risk5) 桶里 328 个 24 位纯 hex 值，325 个落在
+#      下面的窗口内；其余 3 个全是区间外的随机 hex。
+#   ② 更硬的是「连号」—— 同一秒内连续生成的文档 ID 会连号，密钥不会：
+#        6210b04d58f1bb067ef9c742 / ...c743 / ...c744
+#        60eda378877842c4 02636092 / ...02636093 / ...02636094（同前缀 91 个连号）
+#   ③ 跨 5 个库的 1603 桶里共 2334 个不同的 24hex 值，没有一个是带真凭证语境的
+#      会话密钥：6 个带 "appKey" 的也是 appKey: 的值域查表（值本身同样是 ObjectID
+#      形态），61 个靠 "sid" 子串命中（checkinsId 里的 sid，属关键词假阳性）。
+#   它们是数据库文档 ID，不是凭证。
+#
+# 窗口 2015-03-11 ~ 2026-02-26 覆盖小程序生态常见的 ObjectID 生成时间跨度。
+# 区间外占首 4 字节全空间约 91.95%，一律不动 —— 代价是「随机生成的 24 位 hex 密钥
+# 恰好落在区间内」会被当成 ObjectID，理论命中率 = 区间占全空间 8.0469%。
+# 注：上界是固定值，ObjectID 计数器走到 0x6A000000 之后需要上调。
+OBJECTID_TS_MIN = 0x55000000   # 1426063360 -> 2015-03-11
+OBJECTID_TS_MAX = 0x69999999   # 1772093849 -> 2026-02-26
+RE_HEX24_LOWER = re.compile(r"^[0-9a-f]{24}$")
+
+
+def looks_like_mongodb_objectid(s: str) -> bool:
+    """24 位小写 hex、且前 4 字节落在合理时间戳区间 —— MongoDB ObjectID 形态。"""
+    if not RE_HEX24_LOWER.match(s):
+        return False
+    return OBJECTID_TS_MIN <= int(s[:8], 16) <= OBJECTID_TS_MAX
+
+
 def is_hex_token(s: str, stmt: str = None) -> bool:
-    """判断是否为 Hex Token"""
+    """判断是否为 Hex Token
+
+    ObjectID 形态的 24 位 hex 不算 hex token：process_hex_token 只有「token/auth/
+    apikey 语境 -> server_cred_token」「session 语境 -> server_cred_session_key」
+    「无语境兜底 -> server_cred_session_key」三条出口，后两条会把文档 ID 判成
+    risk5 的会话密钥（实测 1603 桶里 99.8% 的行走的就是无语境兜底）。在入口一次性
+    拦掉，比在三条出口各补一次更收敛。拦掉后该值回落到通用分流（risk0），不是丢弃。
+    """
     if len(s) not in VALID_HEX_TOKEN_LENGTHS:
         return False
     if not is_hex_string(s):
+        return False
+    if looks_like_mongodb_objectid(s):
         return False
     return has_min_unique_chars(s, 4)
 
@@ -2536,11 +2577,16 @@ def process_generic_unknown_constant(s: str, stmt: str, src: str, sid: int, res:
 # 7 个互不相干的类型，逐个给判定函数打补丁既漏又不收敛。因此在分类链最前面
 # 统一拦截，一次覆盖全部受影响类型。
 #
-# 归入 other(9901)：
-#   1) 与既有 __scopeId -> other 的处理一致，同一个 __scopeId 家族不会因为
-#      值里多了 data-v-<hash> 就被拆进两个桶；
-#   2) 框架产物不是个人信息，放 pii_noise(2304) 会污染 PII 分类的语义。
-# 不丢弃：命中后仍 append_result，值本身照常入库（只是 risk=0），便于回溯。
+# 直接丢弃（不产出任何类型）：
+#   1) 框架产物是编译器的确定性产物，不是「待定」的未知常量 —— 记进 other(9901)
+#      只是把它从「7 个高敏感桶」挪到「unknown 桶」，噪音并没有真正消失。
+#   2) 新库 unlist_icp_filing_v2 实测：other(9901) 197013 个值里 131516 个是这类
+#      产物（占该桶 66.75%、占全库 data_item 20.11%），而加闸门之前扫出来的旧库
+#      other 桶里只有 0 个 —— 这 13 万条本来就不该入库。
+#   3) 框架产物不是个人信息，放 pii_noise(2304) 会污染 PII 分类的语义，所以
+#      「丢弃」比「换个 risk0 的桶」更准确。
+# 注：同一段代码里的 is_w3c_namespace_url（W3C/XML 命名空间）仍判 other(9901)，
+# 本次不动 —— 那是 16 个值，且是「协议常量」而非「编译产物」，口径不同。
 VUE_SCOPE_HEX = r"[0-9a-f]{6,10}"
 # 裸 scope 标记: data-v-10bfb526
 RE_FW_VUE_SCOPE_BARE = re.compile(rf"^data-v-{VUE_SCOPE_HEX}$")
@@ -2618,8 +2664,8 @@ def perform_constant_classifying(statements: List[str], constants: List):
         # data-v-<hash> 会被 is_cloud_password / is_secret_key / is_payment_param /
         # is_analytics_key 等多个互不相干的判定函数各自误伤，且误判结果随上下文
         # 漂移。在这里一次性拦掉，比逐个补 7 个判定函数更收敛。
+        # 命中即丢弃：不产出任何类型，值不进 data_item。
         if is_framework_artifact(s):
-            append_result(res, IDT.OTHER, s, src, sid)
             continue
 
         # =========================================================
