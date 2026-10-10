@@ -532,6 +532,20 @@ APP_KEY_CONTEXT_WORDS = {
     "accesskey", "access_key", "accessKey",
 }
 
+# is_app_key 的语境词把两种语义混在一起，过去一律判成 platform_app_secret(1101)：
+#   ① 公开 AppKey/ApiKey —— SDK 的客户端标识：友盟(umaAppKey/umengAppKey/UM_APP_KEY/
+#      ymAppKey)、TalkingData(talkingDataAppKey)、腾讯广告(VUE_APP_TENCENT_AD_APP_KEY)、
+#      七鱼(_$configAppKey)、IM/地图/推送 SDK 的 appKey。和 appid 一样随包发布、
+#      必须内置在客户端，本身不是机密 —— 改判 saas_analytics_key(1402)。
+#   ② 凭证 —— 云厂商/开放平台的 AccessKey(Id/Secret) 与 AppSecret/ApiSecret/api_secret，
+#      是凭证对的一半，必须留在 1101。
+# 三库真实语料（unlist_icp_filing_v3 / unlist_package_reference_v2 /
+# unlist_normal_sibling_v2 的 platform_app_secret 桶，is_app_key 命中 898 个值）里 ②
+# 的语境词全部落在下面三个上，其余槽位（appkey/app_key/ymappkey/umaappkey/apikey/…）
+# 都是 ①。
+PUBLIC_APP_KEY_CONTEXT_WORDS = ("appkey", "app_key", "apikey", "api_key")
+CREDENTIAL_APP_KEY_CONTEXT_WORDS = ("accesskey", "access_key", "secret")
+
 APP_SECRET_CONTEXT_WORDS = {
     "secret", "appsecret", "app_secret", "appSecret",
     "clientsecret", "client_secret", "clientSecret",
@@ -2126,6 +2140,14 @@ def is_app_key(s: str, stmt: str) -> tuple:
     # 要求足够的字符多样性，排除低熵噪声（如 f8a69f1719916z，16位仅8个不同字符）
     if not has_min_unique_chars(s, 10):
         return (False, None)
+    # 公开 AppKey 与凭证分流（见 PUBLIC_APP_KEY_CONTEXT_WORDS 的注释）：
+    # 段内出现 appkey/app_key/apikey/api_key、且不出现 accesskey/access_key/secret
+    # 的，是客户端公开标识，复用统计分析 SDK Key 的类型（1402）；
+    # 含 accesskey/secret 的留在 platform_app_secret(1101)。
+    stmt_lower = stmt.lower()
+    if (any(w in stmt_lower for w in PUBLIC_APP_KEY_CONTEXT_WORDS)
+            and not any(w in stmt_lower for w in CREDENTIAL_APP_KEY_CONTEXT_WORDS)):
+        return (True, IDT.SAAS_ANALYTICS_KEY)
     return (True, IDT.PLATFORM_APP_SECRET)
 
 
@@ -2765,6 +2787,10 @@ def perform_constant_classifying(statements: List[str], constants: List):
             continue
 
         # AppKey/ApiKey
+        # is_app_key 现在按语境返回两种类型：公开 AppKey -> saas_analytics_key(1402)
+        # （复用已有的统计分析 SDK Key 类型，不新造类型；process_analytics_key 与
+        # process_app_key 都是 append_result 的一层包装，所以这里不需要再分支）；
+        # 云厂商 AccessKey / AppSecret 等凭证 -> platform_app_secret(1101)
         is_appkey, appkey_slug = is_app_key(s, stmt)
         if is_appkey:
             process_app_key(s, stmt, src, sid, appkey_slug, res)
