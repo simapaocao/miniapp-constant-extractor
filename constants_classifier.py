@@ -636,6 +636,58 @@ STATIC_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".css", ".
 
 MINIAPP_API_PATH_PATTERNS = ("/api/", "/v1/", "/v2/", "/v3/", "api/")
 
+# 组件引用路径：值形如 /components/loading、/component/Common/store-list/index、
+# /wxcomponents/vant/button/index，出现在页面/组件的 usingComponents 声明里
+# （"van-button":"/wxcomponents/vant/button/index"），少数出现在 require(...) 里，
+# 两者都是前端组件引用，不是后端端点。原先第 6 步只挡 /components/，其余拼写一路
+# 掉进「后端 API 路径」兜底。
+#
+# 选「首段是已知组件目录名」的有限枚举，而不是模式匹配，理由（实测三库首段）：
+#   - components 类首段是超长尾：components_new / components-async / components-common /
+#     commoncomponents / comps / compoment / comonents4vant / ui-components … 上百种，
+#     枚举要漏一大片，但任何模式都比枚举更松。
+#   - 模式（如 ^/[a-z_-]*components? 或含 comp 的首段）会顺带吞掉同前缀的非组件目录：
+#     /company(426)、/complaint(61)、/competition(44)、/compilation(40)、/composition(39)
+#     都是 comp 开头但不是组件库（三库 usingComponents 证据率均为 0%），
+#     它们更像接口前缀，判错方向正好是要避免的误伤。
+#   - 枚举的每个成员都用上下文核实过（该前缀的全部值，三库合并 / usingComponents 证据率）：
+#       /components/        42,379 值  96.0%~97.3%
+#       /component/          3,043 值  95.1%~96.1%
+#       /wxcomponents/         958 值  93.9%~97.5%
+#       /vant/                 197 值  98.5%~100%
+#       /components-common/    100 值  86.8%~93.6%
+#       /commpents/             62 值  92.9%~100%（语料里真实存在的拼写错误）
+#     枚举之外还剩一批同样高证据的小前缀没有收（三库合计：comps 62 值 94%~100%、
+#     compts 36 值 100%、compoment 38 值 100%、components-light 33 值 100%……），
+#     它们和 /company(0%)、/complaint(0%)、/competition(0%) 混在同一个 comp 前缀下，
+#     本轮不扩大枚举范围，留作后续按同一取证口径逐个补。
+#   - 本轮把第 6 步的 /components/ 与第 6b 步的组件库前缀合并成同一个判定，并新增
+#     /component/：两族的上下文分布几乎重合（require/import 占比都在 0.1%~1.8%），
+#     分裂成两个类型没有依据，详见 process_generic_slash_prefixed_constant 的注释。
+MINIAPP_COMPONENT_PREFIXES = (
+    "/components/", "/component/", "/wxcomponents/", "/vant/",
+    "/components-common/", "/commpents/",
+)
+
+# 项目自建页面根目录 /page/（不是微信约定的 /pages/），只在「带查询参数」的入口认它。
+# /page/xxx?yyy= 是带参页面路由：实测三库 896 个带参值里 67.2% 上下文是 navigateTo/url
+# 字段；按「请求构造 + REST 动词第二段 + 大写首段」三种可疑形态过一遍只剩 5 个（0.6%），
+# 逐条看仍是 /page/others/auth/auth?from=rescue 这类页面，首段写成大写 /Page/ 的为 0。
+# 而 /page/xxx 不带参数时混着 20.1% 的组件引用（/page/ai_chat/components/AiAttachSheet）、
+# 3.7% 的 require() 模块引用和 1.9% 的接口（/Page/getAdlistByType 一族），
+# 整族归页面会误伤，所以不放宽到无参路径。
+# 故意不加 re.I：语料里 /Page/…（首字母大写）这一族是 PHP 风格控制器
+# （/Page/getAdlistByType、/Page/getIndexRecommedList），值是接口不是页面。
+RE_MINIAPP_PAGE_DIR_ROUTE = re.compile(r"^/page/")
+
+# 小程序内部「静态资源路径」判定用的后缀 = 原 MINIAPP_ASSET_EXTENSIONS ∪ STATIC_EXTENSIONS，
+# 去掉 .js/.json 这类模块后缀（第 2 步已按 MINIAPP_PATH_MODULE 判过，不能在这里抢；
+# 复用 STATIC_EXTENSIONS 是为了补上原先只对绝对 URL 生效的 .pdf，还顺带补了 .css）。
+MINIAPP_PATH_ASSET_EXTENSIONS = MINIAPP_ASSET_EXTENSIONS + tuple(
+    ext for ext in STATIC_EXTENSIONS
+    if ext not in MINIAPP_ASSET_EXTENSIONS and ext not in MINIAPP_MODULE_EXTENSIONS
+)
+
 # 小程序 AppID 正则模式
 MINIAPP_APPID_PATTERN = re.compile(r'^wx[a-f0-9]{15,18}$')  # 微信小程序
 MINIAPP_WW_APPID_PATTERN = re.compile(r'^ww[a-f0-9]{15,18}$')  # 企业微信
@@ -1759,8 +1811,47 @@ def is_miniapp_api_params(s: str) -> bool:
     return s.startswith("/") or has_keyword_substring(s_lower, MINIAPP_API_PATH_PATTERNS)
 
 
+def slash_path_body(s_lower: str) -> str:
+    """斜杠路径的「实体部分」：去掉 ?/# 之后的内容。
+
+    缓存串是 /xxx.png?t=20230714 这类值进不了资源分支的唯一原因，
+    所以后缀判定必须看 ? 之前的部分。
+    """
+    return s_lower.split("?")[0].split("#")[0]
+
+
 def process_miniapp_api_params(s: str, stmt: str, src: str, sid: int, res: list):
-    """分类小程序 API 路径"""
+    """分类小程序 API 路径
+
+    本函数的唯一调用点是 perform_constant_classifying 里 is_miniapp_api_params 那道
+    门，而那道门只收「同时含 ? 和 =」的斜杠路径 —— 也就是说所有带查询字符串的
+    斜杠常量都在这里落地，根本走不到 process_generic_slash_prefixed_constant 的第 7 步
+    （第 7 步对斜杠路径不可达，探针实测三库语料 1,623,044 个 (值, 上下文) 对命中 0 次）。
+    所以「带参数的页面路由」和「带缓存串的静态资源」的改判只能放在这里，
+    放在第 7 步前面对它们没有任何效果。
+    """
+    s_lower = s.lower()
+
+    # 带参数的页面路由：/packageC/pages/payCode/payCode?id=、
+    # /unionMallOnlinePackage/pages/payment/index?groupCode= 这类值上下文是
+    # e.redirectToAction(...)、url: 字段，是前端路由不是后端端点。
+    # 复用第 9 步同一个 helper + 同一个分发函数（含 page_path_sensitive 分流）。
+    # with_page_dir=True 额外认项目自建的 /page/ 根目录（见 RE_MINIAPP_PAGE_DIR_ROUTE）。
+    # 注意这里不调 process_url_query_string：本函数原先也不调，改判不减少任何
+    # query 抽取结果（改前这些值的 query 本来就没被抽过）。
+    if is_miniapp_page_route(s, with_page_dir=True):
+        process_prefixed_miniapp_pages(s, 0, stmt, src, sid, res)
+        return
+
+    # 带缓存串的静态资源：/app/images/share/intro.mp4?time=1、/xxx.png?t=20230714。
+    # 后缀表复用 MINIAPP_PATH_ASSET_EXTENSIONS（含原先只对绝对 URL 生效的 .pdf）。
+    # 只判资源后缀、不判 .js/.json：带参数的 .json 多为接口
+    # （/api/cms/articles/views.json?、/cos/applySignature.json?client=），
+    # 判成模块反而制造误伤。
+    if any(slash_path_body(s_lower).endswith(ext) for ext in MINIAPP_PATH_ASSET_EXTENSIONS):
+        append_result(res, IDT.MINIAPP_PATH_ASSET, s, src, sid)
+        return
+
     append_result(res, IDT.MINIAPP_API_PARAMS, s, src, sid)
 
 
@@ -2277,20 +2368,39 @@ def pii_get_digit_type(s: str) -> str:
 #   /packages/pay/unicashier/index
 # 它们经 URL_SENSITIVE_KEYWORDS 的裸子串匹配被判成支付/登录/后台接口，但值本身是
 # 前端页面路由，不是后端端点。
-RE_MINIAPP_PAGE_ROUTE = re.compile(r"/pages/|^/package", re.I)
+#
+# 2026-10 补 subPackages/subPages：原正则只认 /pages/ 与 ^/package，分包目录写成
+# /subPackages/、/subPages/（大小写混写）时判不出来，于是不含敏感词的页面路由一路掉到
+# 「后端 API 路径」兜底，被记成 miniapp_api_params。实测三库 data_item 里首段是
+# /subpages*、/subpackage* 的值共 13,482 个，其中含 API 标记（/api/、/v1/…）的只有 3 个
+# （它们仍按「含 API 标记不算页面路由」的既有优先级判为接口），加这两个前缀不吞真接口。
+# 用 ^/subpackage、^/subpages（不带结尾斜杠）而非 /subpackages/：分包目录名带后缀是常态
+# （/subpackages0/、/subpagesa/、/subpackageb/、/subpagef/……）。
+RE_MINIAPP_PAGE_ROUTE = re.compile(r"/pages/|^/package|^/subpackage|^/subpages", re.I)
 
 
-def is_miniapp_page_route(s: str) -> bool:
+def is_miniapp_page_route(s: str, with_page_dir: bool = False) -> bool:
     """值是否为小程序页面/分包路由形态（不是后端接口路径）。
 
     含 API 路径标记（/api/、/v1/、/v2/、/v3/、api/）的值不算页面路由：
     `/api/v1/pages/list` 里的 "pages" 是 REST 资源名，不是小程序页面目录。
     实测本次从 server_url_payment 改判的 609 个值（1220 个「值 + 上下文」对）里，
     含 API 标记的为 0，所以这条排除不损失任何目标值，只是把这类理论误伤挡在门外。
+
+    with_page_dir=True 时额外认项目自建的 /page/ 根目录。默认 False：只有带查询参数的
+    入口（process_miniapp_api_params）需要这条，无参的 /page/xxx 混着组件/模块引用，
+    证据不足不能整族归页面（见 RE_MINIAPP_PAGE_DIR_ROUTE 的注释）。
     """
     if has_keyword_substring(s.lower(), MINIAPP_API_PATH_PATTERNS):
         return False
-    return bool(RE_MINIAPP_PAGE_ROUTE.search(s))
+    # 页面目录前缀只能出现在路径部分。带查询串的值里，页面路径可能只是被当成一个
+    # 查询参数（/index.php?q=/app/leadmall/pages/ 的上下文是
+    # n.$.http("/index.php?q=/app/leadmall/pages/" + t)），那种值是接口不是页面路由。
+    # 本轮从 2001 迁走的 24,259 个值里，这一条正好摘掉该类误伤，对无 ? 的值是恒等变换。
+    path = s.split("?")[0]
+    if with_page_dir and RE_MINIAPP_PAGE_DIR_ROUTE.search(path):
+        return True
+    return bool(RE_MINIAPP_PAGE_ROUTE.search(path))
 
 
 def url_process_path(rel_path: str) -> str:
@@ -2525,8 +2635,12 @@ def process_generic_slash_prefixed_constant(s: str, stmt: str, src: str, sid: in
         append_result(results, IDT.MINIAPP_PATH_MODULE, s, src, sid)
         return
 
-    # 3. 资源文件引用
-    if any(s_lower.endswith(ext) for ext in MINIAPP_ASSET_EXTENSIONS):
+    # 3. 资源文件引用（后缀判定看 ? 之前的部分：/x/rank4.png?202011022153 的尾巴是
+    #    缓存串，不是路径的一部分；带 ? 但不带 = 的资源值原先会一路掉到第 10 步）。
+    #    第 2 步刻意不做同样的「去查询串」处理：带参数的 .json 多是接口
+    #    （/api/cms/articles/views.json?、/api/company/uploadContractPhoto.json?），
+    #    去串后判成模块会制造误伤。
+    if any(slash_path_body(s_lower).endswith(ext) for ext in MINIAPP_PATH_ASSET_EXTENSIONS):
         append_result(results, IDT.MINIAPP_PATH_ASSET, s, src, sid)
         return
 
@@ -2544,8 +2658,20 @@ def process_generic_slash_prefixed_constant(s: str, stmt: str, src: str, sid: in
         append_result(results, IDT.MINIAPP_PATH_MODULE, s, src, sid)
         return
 
-    # 6. 排除组件引用路径 (/components/xxx/xxx 且不含 api/v1 等 API 特征)
-    if s_lower.startswith("/components/") and not has_keyword_substring(s_lower, MINIAPP_API_PATH_PATTERNS):
+    # 6. 排除组件引用路径 (/components/xxx、/component/xxx、/wxcomponents/xxx、
+    #    /vant/xxx、/components-common/xxx、/commpents/xxx，且不含 api/v1 等 API 特征)。
+    #    原先 /components/ 判 1906、下面几种组件库前缀判 1905，同一个函数里两处口径不一致。
+    #    取证后统一到 1906（MINIAPP_PATH_MODULE）：
+    #      - 两族的上下文分布几乎重合，本就该是同一类型（三库实测 usingComponents
+    #        占比 /components/ 96.0%~97.3%、/wxcomponents/ 93.9%~97.5%、
+    #        /component/ 95.1%~96.1%；require/import 都只有 0.1%~1.8%）。
+    #      - 1906 桶里 ref_count 最高的值全是被 usingComponents 引用的组件目录
+    #        （/components/loading 14751 次、/components/aiCreateTip/index 14532 次），
+    #        1905 桶里最高的全是 .png/.svg（/utility/banner/plz_wait_2.png 2415 次），
+    #        两个桶既有的语义已经定死：组件引用属于 1906。
+    #      - 改动量也支持这个方向：挪小族（/wxcomponents 等 1,317 值）比挪大族
+    #        （/components/ 42,379 值）小 30 倍以上。
+    if s_lower.startswith(MINIAPP_COMPONENT_PREFIXES) and not has_keyword_substring(s_lower, MINIAPP_API_PATH_PATTERNS):
         append_result(results, IDT.MINIAPP_PATH_MODULE, s, src, sid)
         return
 
@@ -2567,7 +2693,25 @@ def process_generic_slash_prefixed_constant(s: str, stmt: str, src: str, sid: in
             append_result(results, slug_id, s, src, sid)
             return
 
-    # 9. 后端 API 路径特征判断
+    # 9. 小程序页面/分包路由（必须先于第 10 步的后端路径兜底）
+    #    第 8 步只在「路径含敏感关键字」时才调 is_miniapp_page_route，不含敏感词的页面
+    #    路由会直接掉到第 10 步。实测：三库 miniapp_api_params 里 10.9%~13.0% 的值本就是
+    #    页面/分包路由（/pages/…、/packageA/…、/subPackages/…），上下文是
+    #    e.redirectToAction("/packageI/pages/mall/mall",e) 这类导航调用 —— 不是接口。
+    #    本步三库分别改判 8,472 / 10,180 / 18,011 个值到页面路径。
+    #    这里复用第 8 步同一个 helper + 同一个分发函数（含 page_path_sensitive 分流），
+    #    只把「去向」从 api_params 改成页面路径，不丢弃任何值。
+    #    注（2026-10 复核）：这里原先写「含 ?&= 的值在第 7 步就被 process_url_query_string
+    #    吃掉了，到不了这里」——本轮证明该判断不成立。第 7 步对斜杠路径不可达（探针实测
+    #    三库语料 1,623,044 个 (值, 上下文) 对命中 0 次），带 ?&= 的值其实是在
+    #    perform_constant_classifying 的 is_miniapp_api_params 门就被截住的，根本进不了
+    #    本函数。本轮已在那道门上补了同一条页面判断（见 process_miniapp_api_params），
+    #    带参页面路由不再漏到兜底桶里。
+    if is_miniapp_page_route(s):
+        process_prefixed_miniapp_pages(s, 0, stmt, src, sid, results)
+        return
+
+    # 10. 后端 API 路径特征判断
     #    - 去掉开头的 / 后，至少有一段包含字母
     #    - 长度 >= 4
     #    - 不是纯数字路径

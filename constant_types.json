@@ -553,7 +553,7 @@
         {
           "slug": "miniapp_api_params",
           "risk": 1,
-          "desc": "API path with parameters",
+          "desc": "Backend API path (mixed bucket: still holds module/page paths that cannot be told apart without call-site data)",
           "attributes": {
             "sensitivity": 1,
             "action": "warn"
