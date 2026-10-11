@@ -2777,6 +2777,78 @@ RE_FW_VUE_DIRECTIVE = re.compile(
 RE_FW_WXML_ATTR = re.compile(r"^wx:[a-z][a-z0-9-]*$")
 
 
+# =========================================================
+# HTTP 头名（协议常量，不是凭证）
+# =========================================================
+# 问题：`x-expire-timestamp` / `cache-control` / `X-Auth-Token` 这类**头名**被 5 个
+# 互不相干的类型各判一次。三库去重实测（本报告的量化口径）：
+#   payment_request_params(3) 66 值/10159 次、server_cred_cookie(5) 25 值/3390 次、
+#   payment_nonce(3) 4 值/67 次、cloud_bucket_name(2) 10 值/42 次、
+#   saas_analytics_key(1) 2 值/16 次、cloud_cred_cookie(4) 1 值/1 次、
+#   cloud_cred_password(5) 1 值/0 次。
+# 逐个给那 5 个判定函数打补丁既不收敛也易漏，所以仿 is_framework_artifact 统一拦截。
+#
+# 为什么**不用裸 x- 前缀**：
+#   抽样三库源文件（test-result/fix10_xprefix_scan.py，12 万文件）里以 x-/X- 开头的
+#   不同字面量 374 个，裸前缀会把 374 个全收；其中 214 个不是头名 ——
+#   CSS 字号 `x-large`(111 次)/`x-small`(109 次)、组件名 `x-popup`/`x-nav`/`x-icon`/
+#   `x-modal`/`x-toast`、属性名 `x-attribsPrefix`/`x-attribsNamespace`、
+#   选择器 `x-head-carousel-component .`、拼接前缀 `x-cos-meta-` 等。
+#   因此收严成「枚举 + 结构模式」两部分。
+#
+# 判据 A：标准头名枚举（RFC 7230/7231/7234/7235 与常见 CORS/安全头）。
+HTTP_HEADER_NAMES = frozenset({
+    "accept", "accept-charset", "accept-encoding", "accept-language", "accept-ranges",
+    "access-control-allow-credentials", "access-control-allow-headers",
+    "access-control-allow-methods", "access-control-allow-origin",
+    "access-control-expose-headers", "access-control-max-age",
+    "access-control-request-headers", "access-control-request-method",
+    "age", "allow", "authorization", "cache-control", "connection",
+    "content-disposition", "content-encoding", "content-language", "content-length",
+    "content-location", "content-range", "content-security-policy", "content-type",
+    "cookie", "date", "etag", "expect", "expires", "forwarded", "from", "host",
+    "if-match", "if-modified-since", "if-none-match", "if-range", "if-unmodified-since",
+    "last-modified", "link", "location", "max-forwards", "origin", "pragma",
+    "proxy-authenticate", "proxy-authorization", "range", "referer", "referrer",
+    "retry-after", "server", "set-cookie", "strict-transport-security", "te",
+    "trailer", "transfer-encoding", "upgrade", "user-agent", "vary", "via", "warning",
+    "www-authenticate", "x-content-type-options", "x-frame-options", "x-xss-protection",
+    # 事实标准 / 云厂商约定头（只有一张 `-`，结构模式覆盖不到，只能枚举）
+    "x-requested-with", "x-forwarded-for", "x-forwarded-proto", "x-forwarded-host",
+    "x-real-ip", "x-csrf-token", "x-xsrf-token", "x-api-key", "x-request-id",
+    "x-correlation-id", "x-trace-id", "x-sdk-version", "x-seqid", "x-amz-signature",
+    # 三库实测出现的两段式头名（x-timestamp / x-nonce / X-Signature / X-Token /
+    # x-auth 都在真实头名声明语境里，见 report 里的 source_snippet 证据）
+    "x-timestamp", "x-nonce", "x-signature", "x-token", "x-auth", "x-client-time",
+})
+# 判据 B：x- 厂商头名的结构模式 —— 值必须形如 `x-段-段`，即整值至少含**两个**连字符
+# （x- 之后再接两段以上 `-` 分隔的字母数字），并允许一个结尾的 `=`（x-amz-signature=
+# 这种签名 URL 参数名形态）。
+# 为什么必须「两个连字符」而不是裸前缀：CSS 字号 x-large/x-small、组件名
+# x-popup/x-nav/x-icon/x-modal/x-toast、属性名 x-attribsPrefix/x-systemId、
+# 拼接前缀 x-cos- 都只有**一个**连字符（或带非字母数字字符），会被这条挡在外面；
+# 而库内实测到的头名（x-expire-timestamp / x-account-key / x-cos-copy-source /
+# X-TAI-ChannelId / X-TT-ENV …）全都有两个以上连字符。
+RE_HTTP_X_HEADER = re.compile(r"^x-[a-z0-9]+(?:-[a-z0-9]+)+=?$")
+
+
+def is_http_header_name(s: str) -> bool:
+    """判断是否为 HTTP 头名/协议参数名（**名字**本身，永远不是密钥材料）。
+
+    语境证据（三库 miniapp_to_dataitem.source_snippet）：
+        v["X-TimeStamp"] = g
+        signHeaderKeys:["x-data-api-type","x-expire-timestamp"]
+        delete o["x-cos-copy-source"],delete o["x-cos-metadata-directive"],...
+        u["X-PA-NONCESTR"]=1
+        "X-Auth-Token": wx.getStorageSync("cookie")
+    即：值出现在**头名位置**（对象键 / 头名数组元素），真正的密钥是它对应的另一个值。
+    """
+    low = s.lower()
+    if low in HTTP_HEADER_NAMES:
+        return True
+    return bool(RE_HTTP_X_HEADER.match(low))
+
+
 def is_framework_artifact(s: str) -> bool:
     """判断是否为前端框架/构建产物标记（编译产物，不可能是凭证）。
 
@@ -2832,6 +2904,18 @@ def perform_constant_classifying(statements: List[str], constants: List):
         # 漂移。在这里一次性拦掉，比逐个补 7 个判定函数更收敛。
         # 命中即丢弃：不产出任何类型，值不进 data_item。
         if is_framework_artifact(s):
+            continue
+
+        # =========================================================
+        # HTTP 头名（协议常量，不是凭证）—— 结构性拦截
+        # =========================================================
+        # 与 is_framework_artifact 同样是「一次拦掉，而不是补 5 个判定函数」，
+        # 但归置不同：见 is_http_header_name 的 docstring 与报告 ——
+        # 实测语境 100% 是「头名声明」，值本身是名字不是材料；
+        # 现有类型里没有「HTTP 头名」这一档（miniapp_api_params 的语义是后端 API 路径，
+        # cloud_bucket_name/payment_* 都是别的语义），constant_types.json 本次冻结，
+        # 所以按「不制造新的错误标签」处理：丢弃，不改判到任何既有类型。
+        if is_http_header_name(s):
             continue
 
         # =========================================================

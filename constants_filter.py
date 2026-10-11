@@ -44,6 +44,20 @@ VERY_FREQUENT_N = 120
 MIN_STRING_LEN = 6
 MIN_DIGIT_LEN = 6
 
+# 内联 data: URI（把整张图片/字体塞进 JS 字面量）不作为常量入库。
+# 阈值依据（三库 data_item.type_id=2201 实测，见 test-result/fix10_datauri_dist.py）：
+#   - 该桶 15296 条值 100% 以 "data:" 开头，共存放 12.79 MB、出现 49793 次；
+#   - 长度分布没有自然断点（库内被 scanner_engine._write_batch 截到 1000 字符，
+#     60% 的值正卡在这个截断点，本身就是坏数据）；
+#   - 但把 payload 解码后看像素尺寸就有分界：「1x1/2x2 透明占位图」家族的长度是
+#     GIF/WEBP 54~95、PNG 111~166，而最短的**真图**是 130 字符（1x30 PNG）。
+#     200 覆盖了库内可观测的全部占位小图（唯一超界的 1 条本身是被截断到 1000 的产物），
+#     同时砍掉 98.2% 的值、99.90% 的字符。
+# 只认 "data:" 前缀，所以其它 base64（真正的密钥/签名）完全不受影响；
+# 小图标/spacer（如 data:image/gif;base64,R0lGOD... 这种极短值）仍然照常入库。
+MAX_DATA_URI_LEN = 200
+DATA_URI_PREFIX = "data:"
+
 
 # ---------------------------------------------------------
 # Black list: Unwanted-string heuristics
@@ -178,6 +192,26 @@ def filter_non_ascii_rule(s: str) -> bool:
     if ascii_count < MIN_STRING_LEN:
         return True
     return False
+
+
+def is_oversized_data_uri(s: str) -> bool:
+    """超长的 `data:` URI 是内联的二进制资源，不是常量 —— 应当丢弃。
+
+    为什么放在过滤层而不是分类器：
+      - 这类值的**类型判得没错**（就是 encoding_base64，risk 0），问题只是「体积」，
+        即「这条记录值不值得入库」。给「值不值得入库」立法是过滤层的职责
+        （`is_framework_artifact` 放在分类器是因为那里的类型本身判错了，
+        必须在打类型之前拦）；这里没有类型要修，放进分类器反而会多占分类链上
+        一个「先到先得」的判定位。
+      - 过滤层在分类器之前跑（scanner_engine.perform_scan: extract -> filter ->
+        classify），这里丢掉的值连分类都不会做，不可能挤掉别的值的判定。
+      - extract_* 产出的 statements 索引完全不动（过滤只裁剪 constants 列表，
+        sid 是指向 statements 的下标，删常量不会移动任何下标）。
+      - 阈值是「值的形态」而不是「上下文」，所以放在只看值的 is_unwanted_string 同层，
+        但显式排在白名单之前：白名单是给「短而有意义」的值准备的，
+        PII_KEYS 的裸子串匹配（phone/mobile/...）可能碰巧命中 data: URI 里的字符。
+    """
+    return len(s) > MAX_DATA_URI_LEN and s[:len(DATA_URI_PREFIX)].lower() == DATA_URI_PREFIX
 
 
 def is_unwanted_string(s: str) -> bool:
@@ -396,6 +430,10 @@ def perform_constant_filtering(
     cleaned: List[ConstRd] = []
     for s, sid, src in constants:
         if len(s) <= MIN_STRING_LEN:
+            continue
+
+        # 超长 data: URI（内联图片/字体）直接丢弃，优先级高于白名单
+        if is_oversized_data_uri(s):
             continue
 
         if is_wanted_string(s):
