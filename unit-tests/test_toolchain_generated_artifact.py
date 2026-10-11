@@ -233,12 +233,15 @@ def test_end_to_end_framework_symbol_dropped():
         ("__scopeId", '["__scopeId","data-v-exO"]', IDT.OTHER),
         ("__set_model", '__set_model: function() {}', IDT.OTHER),
         ("__wxspec__", 'var a = "__wxspec__";', IDT.OTHER),
-        # 实测：关掉拦截时 __password 被判 cloud_cred_password(5)（BEM 元素类名误报）
-        ("__password", 'password:"".concat(e,"__password")', IDT.CLOUD_CRED_PASSWORD),
+        # 实测：关掉本拦截时 __password 原判 cloud_cred_password(5)（BEM 元素类名误报）；
+        # fix15 ③ 的单段守卫（`_` 前缀属其射程）也会挡住它，故现为 other(0)。
+        ("__password", 'password:"".concat(e,"__password")', IDT.OTHER),
         # 实测：关掉拦截时 __sentry_xhr_v3__ 被判 saas_analytics_key(1)
         ("__sentry_xhr_v3__", 'var k = "__sentry_xhr_v3__";', IDT.SAAS_ANALYTICS_KEY),
+        # 实测：关掉本拦截时 __wj_userid= 原判 server_cred_cookie(5)（cookie **名** + 空值）；
+        # fix15 ③ 同样收掉它（单段守卫 / 空值 cookie 名），故现为 other(0)。
         ("__wj_userid=", 'o.cookie="".concat(o.cookie,";","__wj_userid=").concat(s)',
-         IDT.SERVER_CRED_COOKIE),
+         IDT.OTHER),
         ("@@iterator", 'var k = "@@iterator";', IDT.OTHER),
         ("@@redux/INIT", 'var t = "@@redux/INIT";', IDT.OTHER),
         ("@@__IMMUTABLE_KEYED__@@", 'var k = "@@__IMMUTABLE_KEYED__@@";', IDT.OTHER),

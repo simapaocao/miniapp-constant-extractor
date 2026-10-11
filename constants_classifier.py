@@ -296,6 +296,30 @@ CRYPTO_PREFIX_WORDS = {
     "-----BEGIN PUBLIC": IDT.CRYPTO_PUBLIC_KEY
 }
 
+# 纯 PEM `BEGIN` 行：值只有 `-----BEGIN … KEY-----`（可带尾随换行/CRLF/转义），没有密钥体。
+#
+# 这类值**不是被截断的密钥**，是**拼接 PEM 用的分隔符字面量** —— 三库真实上下文：
+#   decrypt.setPrivateKey("-----BEGIN RSA PRIVATE KEY-----" + privateKey + "-----END RSA PRIVATE KEY-----")
+#   value: function(){ return "-----BEGIN RSA PRIVATE KEY-----\n" + t.wordwrap(this.getPrivateBaseKeyB64()) + … }
+#   s = "-----BEGIN PRIVATE KEY-----\n" + a.config.javaprik + "\n-----END PRIVATE KEY-----"
+# 材料从来不在这个字面量里：要么是运行时变量，要么（`"-----BEGIN RSA PRIVATE KEY-----".concat("MIIC…")`
+# 那种）在**另一条记录**里。所以它按构造就不可能承载密钥，判掉不丢任何东西。
+#
+# 量化（test-result/risk5_struct/crypto_pem_survey.py + crypto_pem_pairing.py）：
+#   crypto_private_key(2102) 该形态 12 值 / 1,893 次 = 该桶出现次数的 **70.7%**
+#     （`-----BEGIN RSA PRIVATE KEY-----` 1,207 次、`…-----\n` 667 次、`-----BEGIN PRIVATE KEY-----` 6 次…）
+#   同形态在 crypto_public_key 里还有 2 值 / 1,752 次（`-----BEGIN PUBLIC KEY-----` + `…-----\n`），
+#   一并收掉 —— 判据在同一个 CRYPTO_PREFIX_WORDS 循环里，不分公私钥。
+# 同族先例：`;` 开头（WXSS 样式分隔符）、`&参数=`（URL 分隔符）都是「命中即丢弃」。
+# 阈值形态：字符类 `[\s\\nrt]` 排除了 base64 全部字符（A-Za-z0-9+/=），
+# 因此匹配成功即证明后面没有任何密钥体，无需再加长度判断。
+RE_PEM_BEGIN_ONLY = re.compile(r"^-----BEGIN [A-Z0-9 ]*KEY-----[\s\\nrt]*$")
+
+
+def is_pem_header_fragment(s: str) -> bool:
+    """值是否只有一个 PEM `BEGIN` 行（拼接 PEM 的分隔符，不含密钥材料）。"""
+    return bool(RE_PEM_BEGIN_ONLY.match(s))
+
 # Base64 编码的公钥前缀 (DER 格式)
 # MIGf, MIIBIj 等是 RSA 公钥的 Base64 编码开头
 # MHQ, MHY 等是 EC 公钥的 Base64 编码开头
@@ -392,6 +416,23 @@ CLOUD_TOKEN_PREFIXES = {
     "sl.": "dropbox",
 }
 
+# 需要**体形校验**的前缀（前缀 -> 体形正则，体 = 去掉前缀的部分）。
+#
+# 病根：is_cloud_token 只做 `s.startswith(prefix) + 长度 20..200`，既不看 stmt、
+# 也不看体形。`ghp_`/`glpat-`/`xoxb-` 这类前缀不像自然语言，裸 startsWith 没问题；
+# 但 `npm_` 是「普通词 + 下划线」，于是路径与命令行全部命中：
+#     npm_components/@alife/saas-mini/es/alert/index          （路径）
+#     npm_config_report=true npm run task build plugin ...    （命令行）
+# 三库实测 cloud_cred_token(1205) 桶 = 582 值 / 2,237 次，**100% 是 npm_ 前缀**，
+# 且 582/582 的体形都不是 token（含 / @ . - 或空格）——真 token 数为 0。
+# 真 npm token = `npm_` + 36 位 Base62（末 6 位是 CRC32 校验），见
+# https://github.blog/security/announcing-npms-new-access-token-format/
+# 全库（不限类型）582 个 `npm_` 开头的值里，体形纯字母数字的有 **0** 个，
+# 所以这条守卫的真阳性损失为 0。
+CLOUD_TOKEN_BODY_PATTERNS = {
+    "npm_": re.compile(r"^[A-Za-z0-9]{36}$"),
+}
+
 CLOUD_COOKIE_NAMES = (
     "aliyun_", "alicloud_", "acs_", "login_aliyunid",
     "qcloud_", "tencent_", "uin=", "skey=",
@@ -423,6 +464,14 @@ CLOUD_PASSWORD_PLACEHOLDERS = (
 SERVER_COOKIE_CONTEXT_WORDS = (
     "cookie", "cookies", "set-cookie", "setcookie", "set_cookie",
     "sessionid", "session_id", "jsessionid", "phpsessid", "asp.net_sessionid",
+)
+
+# 常见的 cookie **名**（不是 cookie 值）。原先写在 is_server_cookie 体内，fix15 ③ 的
+# 「名 + 空值」判据（_is_cookie_name_without_value）与单测也要用同一份清单，故提到模块级。
+SERVER_COOKIE_NAME_KEYWORDS = (
+    "sessionid", "jsessionid", "phpsessid", "cookie2", "usercookie",
+    "localstorage", "sessionstorage", "visitkey", "globalmemory",
+    "shshshfp", "referer", "msgreaded", "logedout", "removelogincache",
 )
 
 AK_PREFIX_PATTERNS = {
@@ -462,6 +511,15 @@ HEX_TOKEN_CONTEXT_WORDS = (
 HEX_SESSION_CONTEXT_WORDS = (
     "session", "sessionid", "session_id", "sid", "credential",
 )
+# "sid" 是上面元组里唯一的 3 字母短词，且元组一律走 has_keyword_substring（纯子串），
+# 于是 canvasId / goodsId / transid / bxksid / cateRecommendWindowsId / serviceId 里的
+# "sid" 会把一批**数据库文档 ID** 拽进 server_cred_session_key(1603)。三库实测：
+# 仅靠裸 "sid" 子串（去掉 sid 后其余词全不命中）进来的有 37 值 / 147 次，
+# 逐条看过——全是 xxxId 形态，只有 `sid: "…"` 两个键名是真 sid。
+# 因此只把 sid 摘出来走 has_keyword_in_context_strict（独立词/驼峰段边界），
+# 其余长词保持子串语义不变。
+HEX_SESSION_CONTEXT_WORDS_SUBSTR = tuple(
+    k for k in HEX_SESSION_CONTEXT_WORDS if k != "sid")
 
 VALID_HEX_TOKEN_LENGTHS = (24, 32, 40, 64)
 
@@ -1466,6 +1524,20 @@ def looks_like_mongodb_objectid(s: str) -> bool:
     return OBJECTID_TS_MIN <= int(s[:8], 16) <= OBJECTID_TS_MAX
 
 
+def has_hex_session_context(stmt: str) -> bool:
+    """HEX_SESSION_CONTEXT_WORDS 的语境判定：长词走子串，`sid` 走词/驼峰段边界。
+
+    见 HEX_SESSION_CONTEXT_WORDS_SUBSTR 处的说明。
+
+    ⚠ 必须传**保留大小写**的 stmt，不能传 stmt_lower：has_keyword_in_context_strict
+    靠「小写/数字接大写」处断词，喂进全小写会丢掉驼峰段 —— `storeSid` 会被当成单段
+    token `storesid`，`sid` 段就找不到了（真会话键名被挡掉）。子串那条自己会 lower。
+    """
+    if has_keyword_substring(stmt, HEX_SESSION_CONTEXT_WORDS_SUBSTR):
+        return True
+    return has_keyword_in_context_strict(stmt, "sid")
+
+
 def is_hex_token(s: str, stmt: str = None) -> bool:
     """判断是否为 Hex Token
 
@@ -1474,6 +1546,10 @@ def is_hex_token(s: str, stmt: str = None) -> bool:
     「无语境兜底 -> server_cred_session_key」三条出口，后两条会把文档 ID 判成
     risk5 的会话密钥（实测 1603 桶里 99.8% 的行走的就是无语境兜底）。在入口一次性
     拦掉，比在三条出口各补一次更收敛。拦掉后该值回落到通用分流（risk0），不是丢弃。
+
+    注：入口守卫只放**值形**判据（ObjectID 形态与上下文无关）。「无语境」是**语境**
+    判据，放在入口会把 process_hex_token 的两条语境出口变成死代码，所以它归
+    process_hex_token 自己处理（见该函数）。
     """
     if len(s) not in VALID_HEX_TOKEN_LENGTHS:
         return False
@@ -1485,15 +1561,28 @@ def is_hex_token(s: str, stmt: str = None) -> bool:
 
 
 def process_hex_token(s: str, stmt: str, src: str, sid: int, res: list):
-    """分类 Hex Token"""
+    """分类 Hex Token —— 只有**有语境**的才出口，无语境一律回落到通用分流。
+
+    原先第三条出口是无条件兜底 `else -> server_cred_session_key`，把「语句就是值
+    本身」的十六进制串（算法常量：MD5("hello")、国密曲线域多项式 ……）成批推进
+    risk5 会话密钥桶。三库实测（口径：该值的所有 source_snippet 都不含 token/
+    session 类词）：
+        1603 桶 125,923 次出现里 124,868 次（99.16%）走的就是这条兜底；
+        桶里最重的值 5d41402abc4b2a76b9719d911017c592 = MD5("hello")，单库 578 次。
+    去掉兜底后它们回落到通用分流（risk0），不是丢弃 —— 与 is_hex_token 的 docstring
+    一致。
+
+    为什么不是「在 is_hex_token 入口加守卫」：入口守卫只适合放**值形**判据
+    （如 looks_like_mongodb_objectid，与语境无关）。「无语境」是语境判据，放到入口
+    会让下面两条语境出口永远为假 —— 判定被劈成两半，反而更难维护。
+    """
     stmt_lower = stmt.lower() if stmt else ""
 
     if has_keyword_substring(stmt_lower, HEX_TOKEN_CONTEXT_WORDS):
         append_result(res, IDT.SERVER_CRED_TOKEN, s, src, sid)
-    elif has_keyword_substring(stmt_lower, HEX_SESSION_CONTEXT_WORDS):
+    elif has_hex_session_context(stmt):
         append_result(res, IDT.SERVER_CRED_SESSION_KEY, s, src, sid)
-    else:
-        append_result(res, IDT.SERVER_CRED_SESSION_KEY, s, src, sid)
+    # else: 无语境 —— 不出口，回落到通用分流（risk0）。
 
 
 # =========================================================
@@ -1761,9 +1850,17 @@ def process_upload_policy_signed(s: str, stmt: str, src: str, sid: int, res: lis
 # 云服务 Token 检测
 # =========================================================
 def is_cloud_token(s: str) -> tuple:
-    """检测是否为云服务 Token，返回 (是否匹配, 服务商)"""
+    """检测是否为云服务 Token，返回 (是否匹配, 服务商)
+
+    少数前缀（如 npm_）额外要求体形匹配，见 CLOUD_TOKEN_BODY_PATTERNS。
+    """
     for prefix, provider in CLOUD_TOKEN_PREFIXES.items():
-        if s.startswith(prefix) and check_length_range(s, 20, 200):
+        if not s.startswith(prefix):
+            continue
+        body_pattern = CLOUD_TOKEN_BODY_PATTERNS.get(prefix)
+        if body_pattern is not None and not body_pattern.match(s[len(prefix):]):
+            continue
+        if check_length_range(s, 20, 200):
             return (True, provider)
     return (False, None)
 
@@ -1801,13 +1898,16 @@ def is_server_cookie(s: str, stmt: str) -> bool:
         return False
 
     # 排除常见的cookie名称（不是cookie值）
-    cookie_name_keywords = (
-        "sessionid", "jsessionid", "phpsessid", "cookie2", "usercookie",
-        "localstorage", "sessionstorage", "visitkey", "globalmemory",
-        "shshshfp", "referer", "msgreaded", "logedout", "removelogincache",
-    )
+    cookie_name_keywords = SERVER_COOKIE_NAME_KEYWORDS
     s_lower = s.lower()
     if s_lower in cookie_name_keywords:
+        return False
+    # cookie **名** + 空值（`JSESSIONID=` / `PHPSESSID=` / `SessionId=`）：
+    # `=` 右侧是空的，说明这只是拼接用的名字。上面的全值相等检查被那个 `=` 挡掉了。
+    if _is_cookie_name_without_value(s, cookie_name_keywords):
+        return False
+    # 单段值形守卫（与 cloud_cred_password 同族），见 is_single_segment_identifier_name。
+    if is_single_segment_identifier_name(s):
         return False
 
     # 排除隐私政策文本（包含中文）
@@ -1900,8 +2000,79 @@ def is_segmented_identifier_name(s: str) -> bool:
     典型放过：1Passw0rd!xyz / jia23xia4kaoshi5t2 / 123456a /
     o0IN8wTN50QMxX-V4siq_GSRFuts / 3708d2bc-bc52-45a3-8f49-08c62f55f5b3
     （单段值不在射程内：`pwd2` / `WXOFFICIAL` 这类是已知残留。）
+
+    单段残留见 is_single_segment_identifier_name。
     """
     return bool(RE_IDENTIFIER_NAME_VALUE.match(s))
+
+
+# =========================================================
+# 单段值形守卫（fix15 ③）
+# =========================================================
+# is_segmented_identifier_name 要求值由 `.`/`-`/`_` 分成 **≥2 段**，够不到单段的名字。
+# 而单段才是这两个桶的大头（三库实测，见 test-result/risk5_struct/ccp_seg_survey.py）：
+#   cloud_cred_password(1203) 单段占 66~71% 值；
+#   server_cred_cookie(1604)  单段占 41~45% 值。
+# 头部值：`WXOFFICIAL`(163) / `adapter`(180) / `timeout`(176) / `requireIdCard` /
+#   `mobileEmptyTips` / `#tips_popup` / `.page-recharge-wallet-list-balance` / `===success`
+#
+# 选型过程（每一步都拿 fix12 人工核定清单当标尺，见
+# test-result/risk5_struct/ccp_seg_candidates.py）：
+#   · 先把「字母+尾数字」整族（`err3241` / `passwordTips3` / `emoney5` / `A70702000008000803`）
+#     **整个排除** —— 它与弱口令同形（`Admin123` / `video123` / `ytx123456` /
+#     `jdf123456` / `Nihao123` 都是这个形状），正是 fix12 点名不许碰的那一类。
+#   · 「驼峰多词 + 尾数字」（`passwordTips3` / `errorNode2`）看着能把上面这族救回来，
+#     实测**会误杀 `mnP7XKDCaWFjINWi`**（fix12 人工核定的 16 位随机口令，判据
+#     `^[a-z]+(?:[A-Z][a-z0-9]*)+[0-9]*$` 分不清「随机大小写」与「驼峰」）——
+#     故**否决**，不用更宽的写法。
+#   · 最终只留「结构上不可能承载材料」的四类，它们对 fix12 的 29 个核定真阳性
+#     + 2 个材料值的误伤为 **0**：
+#       纯小写英文单词      adapter / timeout / globalmemory / decompress
+#       纯大写单词          WXOFFICIAL / EMPHASIS / AUTHORIZED / PHPSESSID
+#       驼峰纯字母（无数字） requireIdCard / mobileEmptyTips / backFromPhone
+#       单段 + 尾部下划线    recordPsw_
+#     加一条**语法片段前缀**（不是词形，是 CSS/选择器/私有字段的写法）：
+#       `#tips_popup` / `.page-recharge-…` / `===success` / `_is_enter_password`
+#     fix12 明确点名的 `password1` / `password123` / `admin123` 与上述**全部不匹配**
+#     （要么含数字，要么没有 `#`/`.`/`===`/`_` 前缀）—— 已固化成单测的反例矩阵。
+RE_SINGLE_SEGMENT_WORD_NAME = re.compile(
+    r"^(?:"
+    r"[a-z]{3,}"                    # adapter / timeout / globalmemory
+    r"|[A-Z]{3,}"                   # WXOFFICIAL / EMPHASIS / PHPSESSID
+    r"|[a-z]+(?:[A-Z][a-z]+)+"      # requireIdCard / mobileEmptyTips
+    r"|[A-Za-z][A-Za-z0-9]*_"       # recordPsw_
+    r")$")
+RE_SINGLE_SEGMENT_SYNTAX_PREFIX = re.compile(r"^(?:[#.]|===|_)")
+
+# cookie **名** + 空值：`JSESSIONID=` / `PHPSESSID=` / `SessionWsid=` / `ASP.NET_SessionId=`。
+# is_server_cookie 本就有 cookie_name_keywords 排除，但判据是 `s_lower in cookie_name_keywords`
+# （**全值相等**），带 `=` 的形态因那个等号逃掉了。`=` 右侧为空说明这个值只是拼接用的
+# **名字**，不是 cookie 值。三库实测可安全收掉 14 值 / 458 次，且桶内
+# 「cookie名 + 非空值」只有 1 值 —— 非空值一律不动（见 test-result/risk5_struct/cookie_name_only.py）。
+RE_COOKIE_NAME_NO_VALUE = re.compile(r"^[\"']?[A-Za-z][A-Za-z0-9_.\-]*[\"']?=\s*$")
+
+
+def is_single_segment_identifier_name(s: str) -> bool:
+    """值形是否为「单段词形标识符 / 语法片段前缀」——这一类永远不是凭证材料。
+
+    判据、选型过程与误伤量化见上面 RE_SINGLE_SEGMENT_WORD_NAME 的注释块。
+    典型命中：WXOFFICIAL / adapter / timeout / requireIdCard / mobileEmptyTips /
+             recordPsw_ / #tips_popup / .page-recharge-wallet-list-balance /
+             ===success / _is_enter_password
+    典型放过（必须放过）：password1 / password123 / admin123 / Admin123 /
+             video123 / err3241 / emoney5 / mnP7XKDCaWFjINWi /
+             o0IN8wTN50QMxX-V4siq_GSRFuts / signBoardPassword_S8hY
+    """
+    if RE_SINGLE_SEGMENT_WORD_NAME.match(s):
+        return True
+    return bool(RE_SINGLE_SEGMENT_SYNTAX_PREFIX.match(s))
+
+
+def _is_cookie_name_without_value(s: str, cookie_name_keywords: tuple) -> bool:
+    """cookie **名** + 空值（`JSESSIONID=`）—— 见 RE_COOKIE_NAME_NO_VALUE 的注释。"""
+    if not RE_COOKIE_NAME_NO_VALUE.match(s):
+        return False
+    return s.split("=", 1)[0].strip().strip("\"'").lower() in cookie_name_keywords
 
 
 def is_cloud_password(s: str, stmt: str) -> bool:
@@ -1914,6 +2085,10 @@ def is_cloud_password(s: str, stmt: str) -> bool:
     # 值形守卫：多段词形标识符/属性名（见 is_segmented_identifier_name 的注释）。
     # 放在最前面：它是「值形」判据，与后面的排除规则互不依赖。
     if is_segmented_identifier_name(s):
+        return False
+    # 单段残留（WXOFFICIAL / requireIdCard / #tips_popup / ===success …），见
+    # is_single_segment_identifier_name 的注释块。
+    if is_single_segment_identifier_name(s):
         return False
 
     s_lower = s.lower()
@@ -2827,6 +3002,14 @@ def process_generic_alpha_prefixed_constant(s: str, stmt: str, src: str, sid: in
                 # 原有宽松规则（抽成 is_access_token_format，数字开头分支复用同一套）
                 if not is_access_token_format(s):
                     continue
+            elif slug_id == IDT.SERVER_CRED_COOKIE:
+                # cookie 是本条唯一**没有专属判据把关**的出口：只有它靠裸关键词
+                # `"cookie" in stmt` 就出口，于是 `adapter` / `timeout` / `storage` /
+                # `weapp-cookie:` 这类**代码标识符**整族进 risk5。补一层值形守卫
+                # （与 is_server_cookie / is_cloud_password 同一条），见
+                # is_single_segment_identifier_name 的注释块。
+                if is_single_segment_identifier_name(s):
+                    continue
             append_result(res, slug_id, s, src, sid)
             return
 
@@ -3480,8 +3663,10 @@ def perform_constant_classifying(statements: List[str], constants: List):
         # CRYPTO (PEM 格式)
         for pattern, slug in CRYPTO_PREFIX_WORDS.items():
             if s.startswith(pattern):
-                process_prefixed_crypto_key(slug, s, stmt, src, sid, res)
-                consumed = True
+                # 只有 BEGIN 行的 PEM 分隔符不是密钥，见 is_pem_header_fragment。
+                if not is_pem_header_fragment(s):
+                    process_prefixed_crypto_key(slug, s, stmt, src, sid, res)
+                    consumed = True
                 break
         if consumed:
             continue
