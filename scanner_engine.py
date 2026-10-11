@@ -47,6 +47,10 @@ MONITOR_JOIN_TIMEOUT = 5           # 收尾时 join Monitor 的超时
 WRITER_DRAIN_BASE_TIMEOUT = 60     # 收尾时等 Writer 排空的基础超时
 WRITER_DRAIN_MAX_TIMEOUT = 600     # 收尾时等 Writer 排空的上限
 QUEUE_MAXSIZE = 10000
+# data_item.raw_value / miniapp_to_dataitem.source_snippet 都是 TEXT（上限 65535 **字节**）。
+# 这里留 ~535 字节余量；注意必须按**字节**收口：utf8mb4 下一个汉字 3 字节、emoji 4 字节，
+# 按字符切（如 s[:65000]）在纯多字节内容上仍会超列宽。
+TEXT_COLUMN_SAFE_BYTES = 65000
 EXIT_INTERRUPTED = 1
 EXIT_FORCED = 130
 
@@ -92,6 +96,26 @@ def is_infra_status(status: str) -> bool:
 def is_pkg_completable_status(status: str) -> bool:
     """文件级状态（包可以标记完成）。"""
     return not is_infra_status(status)
+
+
+def cap_for_text_column(s: str, max_bytes: int = TEXT_COLUMN_SAFE_BYTES) -> str:
+    """按**字节**上限收口，供 TEXT 列使用（纯函数，方便单测）。
+
+    与 s[:max_bytes] 的区别：切片按字符，utf8mb4 下 65000 个汉字 = 195000 字节，
+    照样超列宽 -> 严格模式下 INSERT 直接失败。这里按字节二分，保证结果
+    len(s.encode('utf-8')) <= max_bytes。
+    """
+    if len(s.encode("utf-8")) <= max_bytes:
+        return s
+    # 字节数 >= 字符数，所以字符数上限不可能超过 max_bytes；再二分收缩
+    lo, hi = 0, min(len(s), max_bytes)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(s[:mid].encode("utf-8")) <= max_bytes:
+            lo = mid
+        else:
+            hi = mid - 1
+    return s[:lo]
 
 
 def is_worker_crash(
@@ -758,7 +782,22 @@ class WriterCore:
                 continue
             appid, _kind_id, slug_id, _risk, content, source_file, detector_source, snippet = row[:8]
             content = content if isinstance(content, str) else str(content)
-            raw_value = content[:1000] if len(content) > 1000 else content
+            # 2026-10-11 放宽：原先是 content[:1000]（前 1000 字符），而 hash 一直用**全文**
+            # 算 —— 于是库里 raw_value 与它自己的 hash_sha256 对不上，且 >1000 的真值被砍成
+            # 残缺串（PEM 私钥实测最长 4220 字符，砍到 1000 后不可用；query_data_item.py
+            # 拿残缺串也回不到源文件）。三库量化（test-result/fix11_trunc_dist.out）：
+            #   · 长度==1000 的被截断行 9384（其中 9177 是以 data: 开头的 >200 字符 URI，
+            #     fix10 之后不再入库）；
+            #   · 源侧还原真值后，去掉 data: 只剩 261 行被截断，其中真值 >65000 的只有 5 行
+            #     （other 3 / miniapp_api_params 1 / server_url_payment 1，都是 risk<=4 噪音）；
+            #   · 最值钱的那批（crypto_private_key 47 行，最长 4220）全部 <=65000，放宽后
+            #     可以全文入库。
+            # 所以这里不是「取消」而是「放宽到 TEXT 列能容纳的字节上限」：再往上
+            # （data: URI 实测最长 1267038 字符）会直接撑爆 TEXT 列，让整条 INSERT 失败。
+            # hash_sha256 仍然按**全文**算，绝不改成按截断后的值算：库里存在 56 个
+            # 「前 1000 字符相同、全文不同」的值（见同报告 C 段），按截断值算 hash 会把
+            # 它们错误合并成一条。
+            raw_value = cap_for_text_column(content)
             hash_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
             data_items.append((slug_id, raw_value, hash_sha256))
             hash_to_meta.setdefault(hash_sha256, []).append(

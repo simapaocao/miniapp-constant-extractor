@@ -392,6 +392,11 @@ PAYMENT_PARAM_NAMES = {
     "sign_type": IDT.PAYMENT_SIGN_TYPE,
 }
 
+# 值侧查表：上面的 12 个写法按小写合并成 8 个 key（timeStamp/timestamp -> 同一个 slug，
+# 因此小写化不会产生冲突）。is_payment_param 用它做「值 == 参数名」判定，
+# 并让每次调用从「12 次子串扫描」变成「1 次 dict 查表」。
+PAYMENT_PARAM_NAME_TO_SLUG = {name.lower(): slug for name, slug in PAYMENT_PARAM_NAMES.items()}
+
 PAYMENT_SECRET_KEYWORDS = (
     "mchkey", "mch_key", "merchantkey", "merchant_key",
     "mchsecret", "mch_secret", "merchantsecret", "merchant_secret",
@@ -1416,7 +1421,32 @@ def _is_valid_payment_value(s: str) -> bool:
 
 
 def is_payment_param(s: str, stmt: str) -> tuple:
-    """检测是否为支付参数，返回 (是否匹配, 分类ID)"""
+    """检测是否为支付参数，返回 (是否匹配, 分类ID)
+
+    值侧判据（fix11 收严）：
+        原实现最后一段是 `if param_name.lower() in stmt_lower` —— 只看**语句**里有没有
+        timeStamp/nonceStr/paySign/signType 这些词，与值本身是什么无关；而 stmt 是值周围
+        512 字符的上下文、必然包含值自己，于是任何含该子串的自指值（$taroTimestamp /
+        timeStamp-wrap / data-signtype）都会把自己判进支付桶。
+        三库实测（test-result/fix11_payparam_flow.out，2401 共 847 个值）：
+          · 该循环贡献的命中里，值正好是支付参数名的只有 1 个（TIMESTAMP）；
+          · 其余是 HTTP 头名（fix10 已拦）/ Taro 框架名 / CSS 类名 / 组件属性名；
+          · 收严后 409 个值不再产出任何类型（噪音直接出局）。
+
+    为什么选「值 == 参数名（大小写不敏感）」而不是「值里以词边界包含参数名」：
+        · 词边界口径多留 50 个值（构成 refs 65 -> 434），多留的全是 `timeStamp-wrap`、
+          `-timeStamp`、`x-expire-timestamp` 这类拼接名，却只少丢 1 个真阳性；
+        · 参数名表里本就同时有 `time_stamp`/`sign_type`/`nonce_str` 写法，词边界对 `_`
+          的处理是无据可依的额外规则；相等判定不需要额外边界语义；
+        · 类型定义（constant_types_doc.md 的 2401「requestPayment 参数
+          (timeStamp/nonceStr/package/paySign/signType)」）指的就是参数**名**。
+
+    已知代价（实测，报告第 4b 节留痕）：2402/2405 的语义其实是「nonceStr/paySign 的
+    **取值**」，相等判定会把真正落在 `paySign:"..."` 值位置上的值改判到
+    server_cred_session_key。按用户要求本次只做值侧相等，未动这条语义，也**未**动
+    CONTEXT_KEYWORDS 里同族的 paysign/noncestr/timestamp 三条（那会删掉
+    `timeStamp:<13位毫秒>` 这类真阳性）。
+    """
     s_lower = s.lower()
     stmt_lower = stmt.lower()
 
@@ -1435,9 +1465,10 @@ def is_payment_param(s: str, stmt: str) -> tuple:
     if not _is_valid_payment_value(s):
         return (False, None)
 
-    for param_name, slug_id in PAYMENT_PARAM_NAMES.items():
-        if param_name.lower() in stmt_lower:
-            return (True, slug_id)
+    # 值侧判据：值本身必须正好是某个支付参数名（12 个写法，按小写合并成 8 个 key）
+    slug_id = PAYMENT_PARAM_NAME_TO_SLUG.get(s_lower)
+    if slug_id is not None:
+        return (True, slug_id)
 
     return (False, None)
 
