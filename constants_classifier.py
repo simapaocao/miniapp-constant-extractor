@@ -106,21 +106,35 @@ def has_keyword_in_context_strict(stmt: str, keyword: str,
 #   | "auth.updatePassword"（数组元素）        | ""                    |（假证据除掉）
 #   | signHeaderKeys:["x-expire-timestamp"]  | signHeaderKeys:[""]   |（假证据除掉）
 #
-# 口径边界（本轮**未**统一，留痕）：
+# 已接入的判据（逐批推广，value 一律**无默认值**：漏改调用点直接 TypeError）：
+#   第 0 批：has_user_id_context / has_cloud_password_context（value 必填）
+#   第 1 批：has_secret_context / has_appkey_context / has_session_key_context /
+#            has_aes_key_context（value 必填）
+#   自始有：has_iv_context（value 有默认值 ""，见下面第 4 条）
+#
+# 口径边界（**未**统一，留痕）：
 #   1. is_rsa_hex_public_key / process_Regex_crypto_key 读的是**整条语句**而不是这个
-#      512 字符窗口，剥值口径与它们不一致；本轮只动逐判据的两处接线，那两处不改。
+#      512 字符窗口，剥值口径与它们不一致；只动逐判据的接线，那两处不改。
 #   2. process_generic_digit_prefixed_constant 里的裸串守卫（如 `if "point" in stmt_lower`）
-#      读的也是原 stmt，本轮不动。
+#      读的也是原 stmt，不动。
 #   3. extract_context 在语句很长时返回的是「3 个空白分隔 token 的 join」，不保证是
 #      原语句的连续切片；值不在窗口里时剥值退化为空操作（保守，不改变原判定）。
-#   4. has_iv_context 仍在用 `stmt.replace(value, "")`（全删、不保留键名位置），本轮
-#      刻意不改（只接两个判据）；口径比这里更狠，键名==值 的 IV 常量会被它误剥。
+#      三库实测：第 1 批四条判据各有 ~59.9–64.1 万次（约 23%）调用属于这种空操作。
+#   4. has_iv_context 仍在用 `stmt.replace(value, "")`（全删、**不**保留键名位置）。
+#      「要不要统一到 external_context」已实测评估过（test-result/b1-strip/
+#      analyze_iv_unify.out），结论是**不统一**：判据级差集 11 对（全部 F→T），
+#      类型级 1 对变 PII_NOISE(200) -> crypto_static_iv(202)。F→T 的来源正是「值自己
+#      占了键名位」：`"45wAAWzMlKbIV6Zbiqpgch": [...]`（值里含 IV，值充当键名）、
+#      `"safe-password-nonce": ""` / `"--vector": i.value`（键名 == 值）、以及三元表达式
+#      `? "68uO6IvE..." : "..."`（`" :` 被 RE_KEYNAME_TAIL 当成键名）。统一会把值自证
+#      重新放回来，净增 1 个误报、0 个真阳性，所以 replace 的更狠口径在这里反而更准。
 #   5. 出现按**子串**匹配（与 str.replace 一致，不是整 token）。因此「值嵌在更长标识符
 #      中间」的那次出现也会被删：`passwordField: "password"` -> `Field: ""`（键名里的
 #      password 段被削掉，该键名不再提供语境）。反过来，值正好是键名**后缀**且后面紧跟
-#      冒号时会被保留（`myField_pwd: "x"` 里的 pwd 不动）。两条接入的判据都有长度下限
-#      （>=6 / >=8），越长的值越不可能嵌在别的标识符里，实害有限；量见
-#      test-result/external-context/analyze_flips.out 的「整 token 口径」对照。
+#      冒号时会被保留（`myField_pwd: "x"` 里的 pwd 不动）。第 1 批 1341 个翻转对里，
+#      「整 token 口径」能多保住语境的有 8 对，但这 8 对**没有一个**改变类型判定
+#      （test-result/b1-strip/analyze_b1.out）；唯一那处类型变更两种口径都删，
+#      所以本轮不引入整 token 口径。
 #
 # 注意 RE_KEYNAME_TAIL **故意不带 `^`**：下面用 `RE.match(stmt, end)` 在指定位置
 # 起判，而 `^` 在带 pos 的 match 里只认字符串开头（除非 re.M），会把键名位置一律
@@ -1363,9 +1377,15 @@ def process_ak_sk_pair(ak_val: str, ak_stmt: str, sk_val: str, sk_stmt: str,
 # =========================================================
 # Session Key 检测
 # =========================================================
-def has_session_key_context(stmt: str) -> bool:
-    """上下文是否处在会话密钥的语境里（见 SESSION_KEY_CONTEXT_WORDS）"""
-    return has_keyword_in_context(stmt, SESSION_KEY_CONTEXT_WORDS)
+def has_session_key_context(stmt: str, value: str) -> bool:
+    """上下文是否处在会话密钥的语境里（见 SESSION_KEY_CONTEXT_WORDS）。
+
+    value 参与剥值（见 external_context）：值自己含 sessionKey / session_key 时不能再
+    单独把语境闸门打开（`wx.setStorageSync("sessionKey", ...)` 这类自指认）。
+    `value` **无默认值**，与 has_user_id_context 同一约定 —— 漏改调用点直接 TypeError。
+    """
+    context = external_context(stmt, value)
+    return has_keyword_in_context(context, SESSION_KEY_CONTEXT_WORDS)
 
 
 def is_session_key(s: str, stmt: str) -> bool:
@@ -1390,7 +1410,7 @@ def is_session_key(s: str, stmt: str) -> bool:
        （实测这 126 个值解码后 6-bit 组均匀落在 [26,63]，正是「字符集被限制在大写以外」
        的特征）。代价：真随机密钥被这条误杀的概率 ≈ 1e-5/个。
     """
-    if not has_session_key_context(stmt):
+    if not has_session_key_context(stmt, s):
         return False
     if len(s) != 24 or not s.endswith("=="):
         return False
@@ -2080,9 +2100,14 @@ def has_iv_context(stmt: str, value: str = "") -> bool:
     return any(kw in context_lower for kw in IV_CONTEXT_SUBSTR_KEYWORDS)
 
 
-def has_aes_key_context(stmt: str) -> bool:
-    """判断上下文是否包含 AES_KEY 含义"""
-    return has_keyword_in_context(stmt, AES_KEY_CONTEXT_KEYWORDS)
+def has_aes_key_context(stmt: str, value: str) -> bool:
+    """判断上下文是否包含 AES_KEY 含义。
+
+    value 参与剥值（见 external_context）：`aesKey: "aesKey"` 这类自赋值常量不再能
+    仅凭值自身建立语境。`value` **无默认值**，与 has_user_id_context 同一约定。
+    """
+    context = external_context(stmt, value)
+    return has_keyword_in_context(context, AES_KEY_CONTEXT_KEYWORDS)
 
 
 def is_iv_identifier_like(s: str) -> bool:
@@ -2273,7 +2298,7 @@ def is_static_iv(s: str, stmt: str) -> bool:
 
 def is_static_aes_key(s: str, stmt: str) -> bool:
     """检测是否为硬编码 AES KEY"""
-    if not has_aes_key_context(stmt):
+    if not has_aes_key_context(stmt, s):
         return False
 
     length = len(s)
@@ -2337,14 +2362,30 @@ def process_weak_algorithm(s: str, stmt: str, src: str, sid: int, res: list):
 # =========================================================
 # Secret/API Key 检测
 # =========================================================
-def has_appkey_context(stmt: str) -> bool:
-    """检查上下文是否包含 appKey 相关关键词"""
-    return has_keyword_substring(stmt.lower(), APP_KEY_CONTEXT_WORDS)
+def has_appkey_context(stmt: str, value: str) -> bool:
+    """检查上下文是否包含 appKey 相关关键词。
+
+    value 参与剥值（见 external_context）：`appKey: "appKey"` 这类自赋值常量不再能
+    仅凭值自身建立语境。`value` **无默认值**，与 has_user_id_context 同一约定。
+
+    顺手留痕（未改语义）：APP_KEY_CONTEXT_WORDS 里的 appKey / apiKey / accessKey
+    三个驼峰写法在 `.lower()` 之后的串上永远匹配不到，是死键 —— 真正生效的只有
+    appkey / app_key / apikey / api_key / accesskey / access_key 六个小写写法。
+    """
+    context = external_context(stmt, value)
+    return has_keyword_substring(context.lower(), APP_KEY_CONTEXT_WORDS)
 
 
-def has_secret_context(stmt: str) -> bool:
-    """检查上下文是否包含 secret 相关关键词"""
-    return has_keyword_in_context(stmt, APP_SECRET_CONTEXT_WORDS)
+def has_secret_context(stmt: str, value: str) -> bool:
+    """检查上下文是否包含 secret 相关关键词。
+
+    value 参与剥值（见 external_context）：值自己含 secret 时不再能单独建立语境
+    （`["getSecretTest"]` 这类把函数名当密钥的自我指认）。注意**键名位置**的出现仍保留
+    （`secret: "secret"` 里的 secret），所以真·自赋值密钥不会被误剥 —— 与
+    has_cloud_password_context 同一口径。`value` **无默认值**，理由同上。
+    """
+    context = external_context(stmt, value)
+    return has_keyword_in_context(context, APP_SECRET_CONTEXT_WORDS)
 
 
 def is_access_token_format(s: str) -> bool:
@@ -2378,7 +2419,7 @@ def is_access_token_format(s: str) -> bool:
 
 def is_app_key(s: str, stmt: str) -> tuple:
     """检测是否为 AppKey/ApiKey，返回 (是否匹配, 分类ID)"""
-    if not has_appkey_context(stmt):
+    if not has_appkey_context(stmt, s):
         return (False, None)
     # 长度下限从 10 提到 16，排除 d5f5e1f6b0 之类的短噪声
     if not check_length_range(s, 16, 40) or s.isdigit():
@@ -2422,7 +2463,7 @@ def process_app_key(s: str, stmt: str, src: str, sid: int, slug_id: int, res: li
 
 def is_secret_key(s: str, stmt: str) -> tuple:
     """检测是否为 Secret/API Key，返回 (是否匹配, 分类ID)"""
-    if not has_secret_context(stmt):
+    if not has_secret_context(stmt, s):
         return (False, None)
 
     length = len(s)
