@@ -85,6 +85,80 @@ def has_keyword_in_context_strict(stmt: str, keyword: str,
 
 
 # =========================================================
+# 剥值：外部证据（把「值自己」从上下文里去掉）
+# =========================================================
+# 病根：语境判据形如 has_keyword_*(stmt, ...)，而 stmt 是值周围 512 字符窗口，
+# **里面包含值本身**。于是
+#     值 = auth.updatePassword
+#       -> stmt 必然含 "updatePassword" -> 命中关键词 "password" -> 语境通过
+# 值自己给自己开闸。全仓原先只有 has_iv_context 做了处理（str.replace 全删）。
+#
+# 但「全删」会连**键名位置**的出现一起删掉，让自赋值常量的证据消失：
+#     H5PayTradeNo: "H5PayTradeNo"   replace 全删 -> ': ""'，键名证据没了
+#     password:     "password"       真弱口令会因此消失
+# 所以这里逐出现判断：**后面（跳过引号与空白）紧跟 `:` 的出现视为键名/属性名位置，
+# 保留**；其余出现（值位置）删掉。
+#
+#   | 语句                                   | 剥值后                |
+#   |----------------------------------------|-----------------------|
+#   | H5PayTradeNo: "H5PayTradeNo"           | H5PayTradeNo: ""      |（键名保留，行为不变）
+#   | password: "password"                   | password: ""          |（仍然检出）
+#   | "auth.updatePassword"（数组元素）        | ""                    |（假证据除掉）
+#   | signHeaderKeys:["x-expire-timestamp"]  | signHeaderKeys:[""]   |（假证据除掉）
+#
+# 口径边界（本轮**未**统一，留痕）：
+#   1. is_rsa_hex_public_key / process_Regex_crypto_key 读的是**整条语句**而不是这个
+#      512 字符窗口，剥值口径与它们不一致；本轮只动逐判据的两处接线，那两处不改。
+#   2. process_generic_digit_prefixed_constant 里的裸串守卫（如 `if "point" in stmt_lower`）
+#      读的也是原 stmt，本轮不动。
+#   3. extract_context 在语句很长时返回的是「3 个空白分隔 token 的 join」，不保证是
+#      原语句的连续切片；值不在窗口里时剥值退化为空操作（保守，不改变原判定）。
+#   4. has_iv_context 仍在用 `stmt.replace(value, "")`（全删、不保留键名位置），本轮
+#      刻意不改（只接两个判据）；口径比这里更狠，键名==值 的 IV 常量会被它误剥。
+#   5. 出现按**子串**匹配（与 str.replace 一致，不是整 token）。因此「值嵌在更长标识符
+#      中间」的那次出现也会被删：`passwordField: "password"` -> `Field: ""`（键名里的
+#      password 段被削掉，该键名不再提供语境）。反过来，值正好是键名**后缀**且后面紧跟
+#      冒号时会被保留（`myField_pwd: "x"` 里的 pwd 不动）。两条接入的判据都有长度下限
+#      （>=6 / >=8），越长的值越不可能嵌在别的标识符里，实害有限；量见
+#      test-result/external-context/analyze_flips.out 的「整 token 口径」对照。
+#
+# 注意 RE_KEYNAME_TAIL **故意不带 `^`**：下面用 `RE.match(stmt, end)` 在指定位置
+# 起判，而 `^` 在带 pos 的 match 里只认字符串开头（除非 re.M），会把键名位置一律
+# 判成「非键名」——第一版就踩了这个坑（`H5PayTradeNo: "H5PayTradeNo"` 被剥成 `: ""`）。
+RE_KEYNAME_TAIL = re.compile(r"[\"'\t ]*:")
+
+
+def external_context(stmt: str, value: str) -> str:
+    """返回「去掉值自身贡献」的上下文：删除值在语句里的出现，但保留键名位置的出现。
+
+    键名位置 = 该出现之后（跳过引号与空白）紧跟 `:` —— 即 `key: "value"` /
+    `"key": "value"` 里的 key。
+
+    与 has_iv_context 原先的 `stmt.replace(value, "")` 相比，这里多保留了**键名位置**的
+    出现（`key: "value"` 里的 key 不动）；但按子串口径，值嵌在更长标识符中间的那次出现
+    仍会被删（`passwordField: "password"` -> `Field: ""`），这是本规则的已知代价。
+
+    空值 / 值不在语句里 / 空语句都是空操作，返回原语句（调用方拿到的一定是 str）。
+    """
+    if not stmt or not value or value not in stmt:
+        return stmt
+    parts = []
+    pos = 0
+    v_len = len(value)
+    while True:
+        idx = stmt.find(value, pos)
+        if idx < 0:
+            parts.append(stmt[pos:])
+            return "".join(parts)
+        end = idx + v_len
+        if RE_KEYNAME_TAIL.match(stmt, end):
+            parts.append(stmt[pos:end])      # 键名位置：保留
+        else:
+            parts.append(stmt[pos:idx])      # 值位置：删掉
+        pos = end
+
+
+# =========================================================
 # 通用验证函数 (提高复用率)
 # =========================================================
 HEX_CHARS = set("0123456789abcdefABCDEF")
@@ -428,24 +502,32 @@ USER_ID_KEYWORDS = {
 }
 
 
-def has_user_id_context(stmt: str) -> bool:
+def has_user_id_context(stmt: str, value: str) -> bool:
     """USER_ID_KEYWORDS 的上下文判定：uid 收紧为「独立词/驼峰段」，其余关键词不变。
 
     uid 走 has_keyword_in_context_strict —— 裸子串会让 uuid / guid / skuId / menuId
     等一并命中 id_user_identifier；userid / openid / account_id 等长关键词仍走原函数。
+
+    value 参与剥值（见 external_context）：值自身的出现不再能单独把语境闸门打开。
+    `value` **无默认值**是刻意的 —— 漏改一个调用点就 TypeError，而不是静默退回旧行为。
     """
-    return (has_keyword_in_context_strict(stmt, "uid", UID_LOOKALIKE_SUBSTRINGS)
-            or has_keyword_in_context(stmt, USER_ID_KEYWORDS - {"uid"}))
+    context = external_context(stmt, value)
+    return (has_keyword_in_context_strict(context, "uid", UID_LOOKALIKE_SUBSTRINGS)
+            or has_keyword_in_context(context, USER_ID_KEYWORDS - {"uid"}))
 
 
-def has_cloud_password_context(stmt: str) -> bool:
+def has_cloud_password_context(stmt: str, value: str) -> bool:
     """CLOUD_PASSWORD_CONTEXT_WORDS 的上下文判定：pwd 收紧为「独立词/驼峰段」，其余不变。
 
     pwd 走 has_keyword_in_context_strict —— 裸子串会让 has_paypwd / dmPwD /
     base64 随机载荷中的 "pwd" 命中；password / passwd / db_pwd 等仍走原函数。
+
+    value 参与剥值（见 external_context）：值自身含 password/pwd 时不再能单独定罪，
+    值形一侧由 is_segmented_identifier_name 承担（fix12）。`value` 无默认值，理由同上。
     """
-    return (has_keyword_in_context_strict(stmt, "pwd")
-            or has_keyword_in_context(stmt, CLOUD_PASSWORD_CONTEXT_WORDS - {"pwd"}))
+    context = external_context(stmt, value)
+    return (has_keyword_in_context_strict(context, "pwd")
+            or has_keyword_in_context(context, CLOUD_PASSWORD_CONTEXT_WORDS - {"pwd"}))
 
 ORDER_ID_KEYWORDS = {
     "orderid", "order_id", "orderno", "order_no",
@@ -1592,7 +1674,7 @@ def is_identifier(s: str, stmt: str) -> tuple:
             return (True, IDT.ID_DEVICE_IDENTIFIER)
         if has_keyword_in_context(stmt, AD_ID_KEYWORDS):
             return (True, IDT.ID_AD_IDENTIFIER)
-        if has_user_id_context(stmt):
+        if has_user_id_context(stmt, s):
             return (True, IDT.ID_USER_IDENTIFIER)
         if has_keyword_in_context(stmt, ORDER_ID_KEYWORDS):
             return (True, IDT.ID_ORDER_IDENTIFIER)
@@ -1606,7 +1688,7 @@ def is_identifier(s: str, stmt: str) -> tuple:
         if s_len in VALID_DEVICE_ID_LENGTHS and s.isalnum():
             return (True, IDT.ID_AD_IDENTIFIER)
 
-    if has_user_id_context(stmt):
+    if has_user_id_context(stmt, s):
         if check_length_range(s, 8, 64) and (s.isdigit() or s.isalnum()):
             # 排除纯小写字母的常见命名模式（页面名、事件名等）
             if s.islower() and s.isalpha():
@@ -1804,7 +1886,7 @@ def is_segmented_identifier_name(s: str) -> bool:
 
 def is_cloud_password(s: str, stmt: str) -> bool:
     """检测是否为云服务密码明文"""
-    if not has_cloud_password_context(stmt):
+    if not has_cloud_password_context(stmt, s):
         return False
     if not check_length_range(s, 6, 64):
         return False
