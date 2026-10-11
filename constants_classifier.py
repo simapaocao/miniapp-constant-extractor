@@ -1747,11 +1747,71 @@ def process_server_cookie(s: str, stmt: str, src: str, sid: int, res: list):
 # =========================================================
 # 云服务密码检测
 # =========================================================
+# 值形守卫：「多段词形标识符/属性名」永远不是密码明文。
+#
+# 问题（fix12 A）：`cloud_cred_password(1203, risk 5)` 的头部全是**名字**而不是密码 ——
+#   API 动作名 `auth.signUpWithEmailAndPassword`(1154 次)、i18n key
+#   `bathCode.prompt2`、事件/常量名 `RESET_PASSWORD`、CSS 类名与图标名
+#   `eye-fill` / `password-view`、属性名 `safe-password-*` …
+# 它们能进这个桶是因为**值自己含 password/pwd** —— 而 has_cloud_password_context(stmt)
+# 判的是整段语句（含值本身），于是值自指就能把上下文闸门打开（与 fix11 在
+# is_payment_param 上发现的自指问题同源）。逐个补关键词排除不收敛，改用值形判据。
+#
+# 剥值轮（external_context）：上下文闸门**自己**也补上了 —— has_cloud_password_context
+# 现在先 external_context(stmt, s) 把值的出现剥掉（键名位置保留），自指证据不再单独定罪。
+# 本值形守卫保留为第二道防线：它拦的是「值形就是名字」这一类，与语境证据独立。
+# 代价（方案甲已接受）：值自身文本提供语境、且值形是材料的（`&admin=admin&pwd=admin`、
+# 43 位随机串…）落不到这个桶。
+#
+# 判据：值由 `.` / `-` / `_` 分隔成 ≥2 段，每段是「纯字母（任意大小写）+ 可选结尾数字」。
+#   · 允许结尾数字：`register-step3` / `v1_step_insu_pwd` / `common_icon_line_invisible1`
+#     都是库内真实噪声成员。
+#   · **不允许数字夹在字母中间**是这条判据的关键：随机材料靠它被放过 —— 三库
+#     「值坐在 password/pwd 赋值位」的取值里，只有
+#     `password: "o0IN8wTN50QMxX-V4siq_GSRFuts"`（icp）与
+#     `signBoardPassword:"signBoardPassword_S8hY"`（normsib）两个像材料，而放宽成
+#     `^[A-Za-z][A-Za-z0-9]*`（只要求段以字母开头）会把这两个真阳性一起丢掉。
+#   · 数字打头的段也不命中（UUID `3708d2bc-bc52-45a3-8f49-08c62f55f5b3`、`MyPage_6`、
+#     `April_2024`）：保守，宁可留噪音。
+#
+# 量化（DB = 2807205 扫描的库；用库内真实 (值, 上下文) 重跑，见
+# test-result/fix12/measure_ccp_guard.py + a_tp_review.py + a_guard_dest_all3.out）：
+#   normsib 1151 值/14172 次（65.8% 值 / 82.6% 次）、icp 777/9026（72.0%/90.7%）、
+#   pkg 814/7618（68.1%/85.2%）不再判该类型。
+#   移出的 (值,上下文) 对（3523+2988+2555=9066）里 99.80% 直接出局（不产出任何类型），
+#   剩 18 对 / 5 值（access_token / credit_card / id_card / refresh_token / workai_ck，
+#   都是「敏感键名列表」的成员）落到 server_cred_cookie(5)：它们修复前就在 risk 5，
+#   风险等级不变，不是「把噪音升级」。清单见 test-result/validate_fix12.py 的
+#   KNOWN_R5_DRIFT。
+#   误伤：三库「值真的坐在 password/pwd 赋值位」的 244 个值（111/80/53），本判据命中
+#   133 个（70/29/34），逐条人工核对**全是常量名/事件名/路由名/图标名/i18n key**
+#   （含 `RESET_PASSWORD: "RESET_PASSWORD"` 这类自赋值常量）；唯一两个像材料的已被放过。
+RE_IDENTIFIER_NAME_VALUE = re.compile(r"^[A-Za-z]+[0-9]*(?:[.\-_][A-Za-z]+[0-9]*)+$")
+
+
+def is_segmented_identifier_name(s: str) -> bool:
+    """值形是否为「多段词形标识符/属性名」（API 动作名 / i18n key / CSS 类名 /
+    属性名 / 常量名 / 路由名）。判据与依据见上面 RE_IDENTIFIER_NAME_VALUE 的注释。
+
+    典型命中：auth.updatePassword / bathCode.prompt2 / RESET_PASSWORD /
+    eye-fill / safe-password-time-stamp / password-view / enter-whitelist-password-login
+    典型放过：1Passw0rd!xyz / jia23xia4kaoshi5t2 / 123456a /
+    o0IN8wTN50QMxX-V4siq_GSRFuts / 3708d2bc-bc52-45a3-8f49-08c62f55f5b3
+    （单段值不在射程内：`pwd2` / `WXOFFICIAL` 这类是已知残留。）
+    """
+    return bool(RE_IDENTIFIER_NAME_VALUE.match(s))
+
+
 def is_cloud_password(s: str, stmt: str) -> bool:
     """检测是否为云服务密码明文"""
     if not has_cloud_password_context(stmt):
         return False
     if not check_length_range(s, 6, 64):
+        return False
+
+    # 值形守卫：多段词形标识符/属性名（见 is_segmented_identifier_name 的注释）。
+    # 放在最前面：它是「值形」判据，与后面的排除规则互不依赖。
+    if is_segmented_identifier_name(s):
         return False
 
     s_lower = s.lower()
@@ -2880,6 +2940,68 @@ def is_http_header_name(s: str) -> bool:
     return bool(RE_HTTP_X_HEADER.match(low))
 
 
+# =========================================================
+# HTML data-* 属性名（模板属性名，不是凭证）
+# =========================================================
+# 问题：`data-sid` / `data-index` / `data-timestamp` / `data-password` 这类
+# **HTML 自定义数据属性名**被 7 个互不相干的类型各判一次。三库实测（口径：库内
+# `raw_value LIKE 'data-%'` 的全部值，见 test-result/fix12/measure_data_attr.py）：
+#   cloud_cred_password(5) 67 值/422 次、payment_request_params(3) 15 值/98 次、
+#   cloud_bucket_name(2) 5 值/10 次、payment_sign_type(1) 3 值/11 次、
+#   saas_analytics_key(1) 2 值/79 次、saas_map_key(2) 1 值/2 次、
+#   server_cred_cookie(5) 1 值/5 次；**非凭证类型（真接口/真 key）里 0 值**。
+# 逐个给判定函数打补丁既不收敛也易漏（同 fix10 对头名的理由），因此统一拦截。
+# 本次修复的直接动因：fix11 把 is_payment_param 的值侧判据收严成「值 == 参数名」
+# 之后，原先靠自指子串混进 payment_request_params(3) 的这一族改由 is_cloud_password
+# 接住（其语境词表含 password/timestamp/pwd），噪音从 risk3 升到 risk5 —— 不拦它
+# 比不修更糟。
+#
+# 为什么这里**可以用裸 data- 前缀**（不像 fix10 的 x- 必须收严成枚举+结构模式）：
+#   data- 是 HTML 规范为「自定义数据属性」保留的**专有前缀**，x- 不是 —— 任何
+#   `data-*` 字符串都在声明「这是个属性名」，而 `x-*` 还同时是 CSS 字号(x-large)、
+#   组件名(x-popup)、变量名(x-attribsPrefix)。量化依据：
+#     · 三库 data_item 里 `LIKE 'data-%'` 的全部值 100% 落在上表 7 个凭证类桶、
+#       且逐个查 source_snippet 全是属性名位置（`_mz(z,'input',[...'data-id'...])`
+#       这类「元素+属性名表」编译产物、CSS 选择器、`["__scopeId","data-v-exO"]`）；
+#       miniapp_api_params / other / PII 等桶里一个都没有 —— 不存在「真接口/真 key
+#       以 data- 开头」的实例。
+#     · 抽样三库源文件（test-result/fix12_data_prefix_scan.py；三库解包目录共
+#       4,470,284 个 js|json|wxml|wxss|wxs|html，按包目录分层随机抽样 9 万）里
+#       `data-` 字面量 26,395 个，命中本模式的 3,769 个全部是「名字」：2,770 个是
+#       fix7 已拦的 data-v-<hash>，其余是属性名（data-event-opts/data-index/data-sid/…）、
+#       以 data- 开头的 BEM 类名（data-card__right__top）、`__scopeId` 值；
+#       其中含 16 位以上 hex 的 **0 个**、前缀大写 `DATA-` 的 **0 个**。
+#       => 裸前缀不会误伤真凭证，无需收严。
+# 与 is_framework_artifact 的关系：不重复也不冲突 —— 那边管的是 `data-v-<hash>`
+# （Vue scoped 标记，含 `data-v-xxx,`/`data-v-xxx{`/`类名 data-v-xxx` 等复合形态，
+# 这里匹配不到）与 v-/wx: 指令；本判据只覆盖「纯属性名形态」的 data-*。二者对
+# 裸 `data-v-<hash>` 都能命中且**归置相同**（都是丢弃），所以行为不变。
+#
+# 直接丢弃（不产出任何类型），与 fix7/is_framework_artifact 的归置一致：
+#   属性名不是密钥材料（真值在 `attr="value"` 的值侧），也不是个人信息；
+#   现有类型里没有「HTML 属性名」这一档，constant_types.json 本次冻结，
+#   记进 other(9901) 只会把噪音从 7 个桶挪到 unknown 桶（见 is_framework_artifact
+#   注释里的 13 万条实测），所以按「不制造错误的标签」处理：丢弃。
+RE_HTML_DATA_ATTR = re.compile(r"^data-[A-Za-z0-9_-]+$")
+
+
+def is_html_data_attr_name(s: str) -> bool:
+    """判断是否为 HTML 自定义数据属性名（`data-*` 形式的**名字**，不是密钥材料）。
+
+    属性名允许大小写混写与下划线（编译产物实测 `data-hasPassword` /
+    `data-ctLineId` / `data-pwdType` / `data-my_time` / `data-devtool_`），
+    只要求 `data-` 前缀本身全小写（HTML 规范里属性名小写；抽样 9 万文件里的
+    字面量实测无 `DATA-` 形态）。裸 `data-`（5 字符，源里是 `e.startsWith("data-")` 的前缀
+    判断）**不拦** —— 它不是属性名，也从未被任何类型误收。
+
+    语境证据（三库 miniapp_to_dataitem.source_snippet，属性名表位置）：
+        oB=_mz(z,'input',['adjustPosition',238,'bindblur',3,'data-sid',6,...],...)
+        oTWD=_mz(z,'image',['catchtap',69,'class',1,'data-img',2,'data-index',3,...])
+        eHG=_mz(z,'view',['bindtap',29,'class',1,'data-designType',2,'data-name',3])
+    """
+    return bool(RE_HTML_DATA_ATTR.match(s))
+
+
 def is_framework_artifact(s: str) -> bool:
     """判断是否为前端框架/构建产物标记（编译产物，不可能是凭证）。
 
@@ -2935,6 +3057,18 @@ def perform_constant_classifying(statements: List[str], constants: List):
         # 漂移。在这里一次性拦掉，比逐个补 7 个判定函数更收敛。
         # 命中即丢弃：不产出任何类型，值不进 data_item。
         if is_framework_artifact(s):
+            continue
+
+        # =========================================================
+        # HTML data-* 属性名（模板属性名，不是凭证）—— 结构性拦截
+        # =========================================================
+        # 与 is_framework_artifact 同属「标记名」拦截，但覆盖的是**纯属性名形态**
+        # 的 data-*（data-sid / data-index / data-timestamp / data-password …），
+        # fix7 的 data-v-<hash> 复合形态这里匹配不到、仍由上一段负责。
+        # 归置同为丢弃，依据见 is_html_data_attr_name 的注释与报告：
+        # 三库 `LIKE 'data-%'` 的值 100% 是属性名/类名/scope 标记，且只落在
+        # 7 个凭证类桶（真接口/真 key 类型里 0 值），现有类型里没有「HTML 属性名」档。
+        if is_html_data_attr_name(s):
             continue
 
         # =========================================================
