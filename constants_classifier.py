@@ -3227,6 +3227,105 @@ def is_url_query_or_css_fragment(s: str) -> bool:
 
 
 # =========================================================
+# 工具链产物：框架 / 编译器 / 运行时生成的符号与语法片段（结构性拦截）
+# =========================================================
+# 问题：三个消息库里有整整一族值**不是代码作者写的常量**，而是工具链吐出来的中间物。
+# 三库实测（口径：库内真实 (值,上下文) 重跑当前代码，见 test-result/fix14/a_census.py）：
+#   A. `;`  开头   29,905 值 / 1,389,145 次
+#   B. `__` 开头    6,621 值 /   228,445 次
+#   C. `@@` 开头      168 值 /    75,675 次
+#   合计 36,694 值 / 1,693,265 次（≈全库出现次数的 9%）。
+# 落桶：`other`(0) 几乎全部，另有 4 个凭证误报桶 —— server_cred_cookie(5) 205 次、
+#   cloud_cred_password(5) 30 次、cloud_cred_cookie(4) 2 次、saas_analytics_key(1) 4 次。
+#
+# 这族与 is_framework_artifact（fix7 拦的 data-v-<hash> / v- / wx:）是同一类东西：
+# 都不是代码作者写的常量，是工具链生成的。但**判据形态不同**，所以另立一个函数
+# （理由见下）：fix7 那套是「标记名**全值**匹配」（32 项断言里 29 个反例专门证明
+# `v-binder-secret-…` / `myData-v-12345678` / `data-vault-key-…` 这类近似形态不被误吞），
+# 本条是「**保留前缀**」——精度来自前缀本身被生态圈保留，而不是来自全值形状。
+#
+# ---- 三族各自的来源与边界（逐条量化，本轮重点是误伤体检）----
+# A. `;` 开头 = WXSS 被内联进 JS 后切碎的样式片段。
+#    来源已确证（三库 source_snippet）：
+#        __wxAppCode__['pages/goods/index.wxss'] = setCssToHead([[2,"./pages/goods/index.wxss"], …
+#        setCssToHead(["@charset \x22UTF-8\x22;\nwx-view{font-size:",[0,28],";lin…
+#    setCssToHead 按「动态值占位」把 wxss 切开，切出的每一片都以 `;` 开头
+#    （头几名 `;height:` 65,449 次 / `;line-height:` 60,411 / `;padding:` 55,884）。
+#    它们是代码里**真实的字符串字面量**，提取器没做错 —— 是这些值本来就不算「常量」。
+#    **误伤体检（本轮最关键）**：29,905 个值逐个过 9 条硬线索（URL / 域名 / 中文 /
+#    hex>=16 / key|token|secret 词 / appid / 路径 / @ / 高熵），命中的全部人工过目：
+#      · SQL 片段 0 个（含 SQL 关键字 29 个全部是 CSS 的 `user-select`；
+#        三库 `LIKE '%SELECT %FROM%'` 的 SQL 语句**无一以 `;` 开头**）；
+#      · JSON 片段 0 个（JSON 以 `{`/`[` 开头，与前缀互斥）；
+#      · 含 `=` 且右侧有内容的只有 44 个，逐个看过全是 cookie 属性 / charset /
+#        查询参数（`;charset=utf-8`、`;path=/;domain=.ktvme.com`、`;page_size=20;page_index=1`），
+#        **没有一条内嵌真密钥**（与 fix13 的 `&key=<真 key>` 情形不同：`;` 是头/样式分隔符，
+#        其右值是运行时拼接上去的动态量，静态字面量里没有密钥材料）；
+#      · 手写 CSS 常量**不受影响**：判据是前缀匹配，`"width:100px"` / `"display:none"`
+#        这种不以 `;` 开头的值根本进不来。爆炸半径实测：库里「含 `;` 但不在首位」的值
+#        有 1,818 + 6,228 + 18,890 个（如 `0;width:`、`!important;position:relative;width:`），
+#        本轮**一个都不动**。
+# B. `__` 开头 = 框架 / 编译器 / 运行时的内部符号（JS 双下划线约定）。
+#    头部：`__scopeId` 32,421 次（Vue scoped 样式）、`__set_model` 24,050（WXML 数据绑定）、
+#    `__wxspec__` 14,071（微信框架）、`__DC_STAT_UUID` 7,825（统计 SDK）、
+#    `__webpack_require_UNI_MP_PLUGIN__` 3,561（webpack）、`__compileDebugInfo__` 3,050（编译信息）。
+#    **误伤体检**：6,621 个值当前只落 other(0) 与 4 个误报桶，落到非 other 的**只有 6 个**，
+#    逐个看过全是误报（`__password` / `__password--active` / `__password--dot` 是 BEM 元素类名；
+#    `__wj_userid=` / `__cube__tm=` 是 cookie 名；`__sentry_xhr_v3__` 是 Sentry 标记名）。
+#    JS 内建 dunder（`__proto__`）**不在库**；base64/hex 密钥的字母表分别是 A-Za-z0-9+/ 与
+#    0-9a-f，**结构上不可能以 `__` 开头**，所以「以 `__` 开头的真密钥」不存在。
+#    注：B 族里最大的一块是 `__plugin__/wx…/pages/…`（1,274 值 / 24,139 次），
+#    即小程序插件的虚拟路径（`__plugin__/` 前缀由编译器注入）——当前同样落 other(0)，
+#    丢弃不损失任何已分类产出。
+# C. `@@` 开头 = JS 语言内部 well-known symbol + 各框架的 action 前缀。
+#    头部：`@@iterator` 39,885 次、`@@toStringTag` 15,543、`@@asyncIterator` 13,217、
+#    `@@__IMMUTABLE_*__@@`、`@@redux/*`、`@@DVA_*`、`@@transducer/*`、`@@taro-*`。
+#    **误伤体检**：168 个值已**全量列出**逐个过目，无一例外都是框架内部标记。
+#    邮箱/句柄不会被误伤 —— 邮箱的 local-part 不能以 `@` 开头，三库含 `@` 且含 `.` 的
+#    13,527 个值里**没有一个以 `@@` 开头**。
+#
+# ---- 为什么是「丢弃」而不是改判 ----
+# 与 fix7 / fix10 / fix12 / fix13 的归置一致：这些值不是密钥材料，现有类型里没有
+# 「工具链中间物」这一档（constant_types.json 本轮冻结），记进 other(9901) 只是把噪音
+# 从几个误报桶挪到 unknown 桶、噪音并没有消失（fix7 注释里的 13 万条实测）。所以按
+# 「不制造新的错误标签」处理：丢弃，不产出任何类型。
+#
+# ⚠️ 口径坑（本轮实测踩到，供后续复用）：MySQL 的 `LEFT(x,1) = CHAR(59)` 在
+#   utf8mb4_unicode_ci 下**同时匹配全角 `；`(U+FF1B)** —— 三库 A 族各有 8/1/9 条是全角
+#   分号开头的中文 UI 文案（`；如您预约成功的时间为10:30…`），而 Python 的
+#   `s.startswith(";")` 只认 ASCII 分号。所以普查一律用 `HEX(LEFT(...))` 精确比码点。
+#   同理，`LIKE` 里 `_` 是「任意单字符」通配符，B 族的 `__` 绝不能用 `LIKE '__%'` 匹配。
+TOOLCHAIN_ARTIFACT_PREFIXES = (";", "__", "@@")
+
+
+def is_toolchain_generated_artifact(s: str) -> bool:
+    """判断是否为框架 / 编译器 / 运行时生成的符号或语法片段（工具链产物，不是常量）。
+
+    三条判据都是**保留前缀**，覆盖「作者不可能这么写」的三种开头：
+      - `;`  —— 语句/声明分隔符开头。wxss 被 setCssToHead 内联进 JS 后切出的样式片段
+               （`;height:`），以及拼接到已有串尾部的 cookie 属性片段（`;PHPSESSID=`）。
+               正常常量（手写 CSS `width:100px`、SQL、JSON）都不以 `;` 开头。
+      - `__` —— JS/生态圈的「内部符号」约定。Vue/微信/webpack/lodash/sentry 等
+               框架内部字段与编译器注入的虚拟路径（`__scopeId` / `__plugin__/wx…`）。
+      - `@@` —— ECMAScript well-known symbol 的书写形式（`@@iterator`）与各状态管理
+               框架的 action 前缀（`@@redux/INIT` / `@@DVA_LOADING/HIDE`）。
+
+    与 is_framework_artifact 的分工：那边管**标记名**（`data-v-<hash>` / `v-bind:x` /
+    `wx:y`，全值正则匹配，怕误吞 `v-binder-secret-…` 这类近似值）；本条管**开头**，
+    精度来自前缀被生态圈保留（实测三库 36,694 个值里真阳性 0 个，见上方注释）。
+
+    语境证据（三库 miniapp_to_dataitem.source_snippet）：
+        __wxAppCode__['pages/goods/index.wxss'] = setCssToHead([[2,"./pages/goods/index.wxss"]…
+        setCssToHead(["@charset \x22UTF-8\x22;\nwx-view{font-size:",[0,28],";lin…
+        t.header.Cookie = "oid=".concat(u("moid") || "", "; sessionid=").concat(…
+        ["__scopeId","data-v-exO"]
+        o.cookie="".concat(o.cookie?"".concat(o.cookie,";"):"","__wj_userid=").concat(s)
+        @@iterator  /  @@__IMMUTABLE_KEYED__@@  /  @@redux/INIT
+    """
+    return s.startswith(TOOLCHAIN_ARTIFACT_PREFIXES)
+
+
+# =========================================================
 # 主分类函数
 # =========================================================
 def perform_constant_classifying(statements: List[str], constants: List):
@@ -3293,6 +3392,22 @@ def perform_constant_classifying(statements: List[str], constants: List):
         # pii_email_name(3) 1 值/1 次原样不动。
         # 误伤边界（内嵌 key、路径类常量、`.` 相对路径）见 is_url_query_or_css_fragment 注释。
         if is_url_query_or_css_fragment(s):
+            continue
+
+        # =========================================================
+        # 工具链产物：框架/编译器/运行时生成的符号与语法片段 —— 结构性拦截
+        # =========================================================
+        # 与 is_framework_artifact 同一族（都不是作者写的常量），但判据形态不同：
+        # 那条是全值匹配「标记名」，本条是保留前缀「`;` / `__` / `@@` 开头」。
+        # 归置同为丢弃，依据见 is_toolchain_generated_artifact 的注释与报告：
+        # 三库 36,694 值 / 1,693,265 次命中，逐族做完误伤体检（真阳性 0 个）：
+        #   `;`  29,905 值 —— SQL/JSON 0 个、内嵌真密钥 0 个、手写 CSS 前缀不匹配；
+        #   `__`  6,621 值 —— 落到非 other 的只有 6 个且全是既有误报；
+        #   `@@`    168 值 —— 全量过目，全是框架内部标记（邮箱不可能以 `@` 开头）。
+        # 清掉的 risk>=4 误报：server_cred_cookie 205 次、cloud_cred_password 30 次、
+        # cloud_cred_cookie 2 次（另 saas_analytics_key(1) 4 次）—— **没有新噪音进 risk>=4 桶**
+        # （纯丢弃不会新增产出，实测见 test-result/fix14/f_before_after.py）。
+        if is_toolchain_generated_artifact(s):
             continue
 
         # =========================================================
