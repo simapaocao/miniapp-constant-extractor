@@ -3151,6 +3151,82 @@ def is_framework_artifact(s: str) -> bool:
 
 
 # =========================================================
+# URL 查询片段 / CSS 选择器 / CSS 模块类名（语法片段，不是凭证）
+# =========================================================
+# 问题：把一条 URL 或一段模板编译产物按 `&` / `^` / `-module__` 切开之后，切出来的
+# **语法片段本身**被当成常量收进了库，并被凭证类判定函数接住。三库实测（口径：库内真实
+# (值,上下文) 重跑当前代码，见 test-result/fix13/a_census.py；按「裸前缀族」统计）：
+#   A. `&` 开头    cloud_cred_password(5) 164 值/1965 次、cloud_cred_cookie(4) 14 值/74 次
+#   B. `^` 开头    cloud_cred_password(5)   7 值/58 次
+#   C. `-module__` cloud_cred_password(5)  12 值/14 次、saas_map_key(2) 1 值/4 次
+# 典型的头几名：`&callBack=`(46 次) `&password=`(44) `^navigate`(22) `&target=`/`&username=`(各 14)
+# `&newPassword=`(8) `^stillPassword`(4) `LoginPage-module__pwd-input___nXiLS`。
+# 逐个给判定函数打补丁既不收敛也易漏（同 fix10/fix12 对头名、data-* 的理由），因此统一拦截。
+#
+# 为什么**不用 `.` 开头**当判据（本轮的硬约束）：
+#   `other` / `miniapp_path_module` / `miniapp_api_params` 里以 `.` 开头的值极多
+#   （normal_sibling 的 other 一个桶就 2.7 万），其中 `./components/foo`、`../utils/x`
+#   是**合法的相对路径**，按前缀拦会成片误伤路径类常量。所以本轮只收拢下面三小类。
+#
+# 为什么判据必须**收窄**（实测误伤，本轮最关键的取舍）：
+#   三小类的「裸族」里，A 族远不是同质的：最宽的写法「`&` 开头」、甚至「`&名=值`」，
+#   都会把**查询串里内嵌的真 key** 一起丢掉。实测（test-result/fix13/f_embedded_secret.py）
+#   这类条目共 163 条 / 136 个去重值，例如：
+#       `&key=97b588d3e3e852c4acbe118886022078`       （高德 key，20 次）
+#       `&key=UBNBZ-PTP3P-TE7DB-LHRTI-Y4YLE-VWBBD`    （腾讯地图 key，12 次）
+#       `&key=8b650dd596444be8bb603d181591cba6`       （MD5 签名密钥）
+#       `&token=b8e41f749d861dda`
+#   因此 A 族收成「**整个值就是一个空值参数名**」的 `&名=` 形态 —— 右侧没有内容，
+#   结构上不可能内嵌任何东西（实测内嵌敏感值 0 条）。宽写法同时会吃掉
+#   `&serviceDir=/api/public/index.php?service=X`（真接口端点，miniapp_api_params 30 值）
+#   与 `&emsp;&emsp;电子邮箱：id@189.cn`（PII_EMAIL_NAME），收窄后两者都留住。
+#   `^标识符` 与 `-module__` 两条同理收成全值匹配：`^1\d{10}$` 这类**校验用正则**
+#   含反斜杠、`^1.2.3` 这类 semver 数字开头，都匹配不到。
+#
+# 为什么是「丢弃」而不是改判：
+#   URL 查询片段不是密钥材料（真值在 `=` 的右侧），CSS 选择器/类名更不是；
+#   现有类型里没有对应档位，constant_types.json 本轮冻结。三库实测这三条判据命中的值
+#   在库内**从未**落到任何真凭证类型（platform_app_secret / cloud_cred_ak_sk_pair /
+#   saas_analytics_key / server_url_* 等 0 条），只落在凭证类误报桶 + other(0)。
+#   把 other 桶里的这部分也一并去掉：它们同样只是切碎的语法片段
+#   （抽 40 个去看，全部形如 `&goodsType=3` / `^toCardDetail` / `index-module__pwd___a1Xy`）。
+#   唯一被顺带清掉的非 risk>=4 项是 saas_map_key(2) 的
+#   `index-module__content-wrap___2AMAP` —— 该值是类名里撞上 `AMAP` 造成的既有误报。
+#
+# ⚠️ 口径坑（本轮实测踩到，供后续复用）：MySQL 的 `LIKE` 里 `_` 是「任意单字符」通配符，
+#   `raw_value LIKE '%-module__%'` 的真实语义是 `%-module` + 任意 2 字符 + `%`，会把
+#   `/login-module/auth/login`（**真接口路径**）也捞进来（三库多捞 2,880 条 (值,类型)）。
+#   所以体检/复现一律用 `INSTR(raw_value,'-module__') > 0` 或转义后的 `LIKE`。
+RE_URL_EMPTY_PARAM = re.compile(r"^&[A-Za-z][A-Za-z0-9_.\-]*=$")
+RE_CSS_CARET_TOKEN = re.compile(r"^\^[A-Za-z_][A-Za-z0-9_\-]*$")
+RE_CSS_MODULE_CLASS = re.compile(r"^[A-Za-z0-9_#][A-Za-z0-9_\-]*-module__[A-Za-z0-9_\-]+$")
+
+
+def is_url_query_or_css_fragment(s: str) -> bool:
+    """判断是否为被切碎的 URL 查询片段 / CSS 选择器 / CSS 模块类名（**语法片段**，不是凭证）。
+
+    三条判据都是**全值匹配**，且都只覆盖「结构上不可能承载秘密」的形态：
+      - `&参数名=`  —— 整个值就是一个空值参数名（`&password=` / `&callBack=`）；
+        右侧没有内容，所以不会把 `&key=<真 key>` 一起吞掉。
+      - `^标识符`   —— 模板编译产物里的属性/事件选择器名（`^navigate` / `^stillPassword`）；
+        校验用正则（`^1\\d{10}$`）含反斜杠、semver（`^1.2.3`）数字开头，都匹配不到。
+      - `名-module__名` —— CSS Modules 产物类名（`LoginPage-module__pwd-input___nXiLS`）。
+
+    语境证据（三库 miniapp_to_dataitem.source_snippet）：
+        url:e.default.host+"/oauth/token?grant_type=password&username="+a+"&password="+d
+        Z([[4],[[5],[[4],[[5],[[5],[1,'^stillPassword']],[[4],[[5],[[4],[[5],[1,'stillPassword']]]]]]]]])
+        "pwd-input": "LoginPage-module__pwd-input___nXiLS"
+    """
+    if s.startswith("&"):
+        return bool(RE_URL_EMPTY_PARAM.match(s))
+    if s.startswith("^"):
+        return bool(RE_CSS_CARET_TOKEN.match(s))
+    if "-module__" in s:
+        return bool(RE_CSS_MODULE_CLASS.match(s))
+    return False
+
+
+# =========================================================
 # 主分类函数
 # =========================================================
 def perform_constant_classifying(statements: List[str], constants: List):
@@ -3204,6 +3280,19 @@ def perform_constant_classifying(statements: List[str], constants: List):
         # cloud_bucket_name/payment_* 都是别的语义），constant_types.json 本次冻结，
         # 所以按「不制造新的错误标签」处理：丢弃，不改判到任何既有类型。
         if is_http_header_name(s):
+            continue
+
+        # =========================================================
+        # URL 查询片段 / CSS 选择器 / CSS 模块类名（语法片段）—— 结构性拦截
+        # =========================================================
+        # 与 is_http_header_name 同样是「一次拦掉，而不是补 N 个判定函数」，归置同为丢弃。
+        # 三库实测本判据清掉的 risk>=4 误报：cloud_cred_password 143 值/1924 次、
+        # cloud_cred_cookie 8 值/19 次；顺带清掉 saas_map_key(2) 的 1 值/4 次
+        # （类名撞上 AMAP 的既有误报）。risk>=4 总出现次数 2111 -> 168，
+        # **没有任何新噪音进 risk>=4 桶**；miniapp_api_params(1) 30 值/62 次、
+        # pii_email_name(3) 1 值/1 次原样不动。
+        # 误伤边界（内嵌 key、路径类常量、`.` 相对路径）见 is_url_query_or_css_fragment 注释。
+        if is_url_query_or_css_fragment(s):
             continue
 
         # =========================================================
