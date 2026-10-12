@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 """fix21：identifier 类组四处噪音修复的回归测试（①id_device ②id_ad ③id_user ④id_order）。
 
+fix22 的断言也加在本文件末尾（"fix22" 小节）：fix21 ③④ 收严后，被排除的名字类值继续往下
+走到凭证判据上，14 行由 risk 2~3 升到 risk 5；fix22 把这批值在凭证判据接手时改判
+id_noise，并钉住改动面（真 openid / 真订单号 / 「本来不产出」的值 / 既存同类误报都不动）。
+
 背景（三库 _v2 实测；口径：出现次数 = SUM(data_item.ref_count+1)，只从 data_item 求和；
 详见 test-result/fix21/ 下的回放脚本与报告）
 -------------------------------------------------------------------------------
@@ -275,6 +279,148 @@ def test_4_true_orders_survive():
     for v, stmt in cases:
         got = classify(v, stmt)
         check(f"④ 真订单号仍在 id_order: {v}", ORDER in got, f"got={got}")
+
+
+# =========================================================
+# fix22：命名形态落选 → 被下游凭证判据接手时 consuming 成 id_noise
+# =========================================================
+# 病根（fix21 ③④ 的直接延续）：上面这些「名字/文案形态」的值被 identifier 臂排除后
+# **继续往下走**，落到下游的凭证判据上 —— 三库用真实 (值,上下文) 重跑实测 14 行 / 17 次
+# （cloud_cred_password 13 行 / 16 次、server_cred_cookie 1 行 / 1 次）由 risk 2~3 升到
+# risk 5。归置：改判既有 id_noise(2505, risk0)，**且只在凭证判据真要接手时**（见
+# constants_classifier.NAME_CLASS_REJECT 与 perform_constant_classifying 的 fix22 注释）。
+#
+# 本段守住三件事：
+#   ① 这 14 行确实从风险桶回到 id_noise；
+#   ② **改动面不外溢** —— 既有的同类误报（不是本轮升级、且由既有排除造成）一律不动，
+#      真 openid / 真订单号 / 真凭证一律不动，「本来不产出」的值仍是「不产出」；
+#   ③ 三态回报的边界（只回报 fix21 新加的那几条命名排除）。
+RISK5 = (IDT.CLOUD_CRED_PASSWORD, IDT.SERVER_CRED_COOKIE)
+
+# 14 行：值 + 复现语境（保留触发机制：既要有 identifier 臂的用户/订单关键词，
+# 又要有凭证判据的关键词/裸 cookie 出口）。真实语境见 test-result/fix22/ 的报告与
+# m_ctx.out（512 字符窗口版；其中 normsib `在线建档h5需要unionId` 一条用真实全文）。
+FIX22_ROWS = (
+    ("ByPhoneRegisteredUsers", 'o.ResetPassword="x",userId:"u",t=ByPhoneRegisteredUsers',
+     IDT.CLOUD_CRED_PASSWORD),
+    ("IdCardOcrAsync", 'o.RetrievePassword="x",userId:"u",t=IdCardOcrAsync',
+     IDT.CLOUD_CRED_PASSWORD),
+    ("VerifyPhoneRegister", 'o.ResetPassword="x",uid:"u",t=VerifyPhoneRegister',
+     IDT.CLOUD_CRED_PASSWORD),
+    ("MobileNumberToLoginOrRegistered",
+     'havePassword=!1,openId:"x",h("MobileNumberToLoginOrRegistered")', IDT.CLOUD_CRED_PASSWORD),
+    ("PhoneNumber", 'invoice:"",openid:"",resetPassword:"",u=PhoneNumber',
+     IDT.CLOUD_CRED_PASSWORD),
+    ("csairlugtransH5", 'orderNo:"1",resetPassword:"",t={csairlugtransH5:"/p/channelCodeH5/index"}',
+     IDT.CLOUD_CRED_PASSWORD),
+    ("emallH5Sichuan", 'orderId:"1",passWord:"",t={emallH5Sichuan:"/p/index"}',
+     IDT.CLOUD_CRED_PASSWORD),
+    ("holidayBocheH5", 'orderNo:"1",pwd:"",t={holidayBocheH5:"/p/index"}',
+     IDT.CLOUD_CRED_PASSWORD),
+    ("holidayPostScheduleH5", 'tradeno:"1",password:"",t={holidayPostScheduleH5:"/p/index"}',
+     IDT.CLOUD_CRED_PASSWORD),
+    ("holidayViewTicketH5", 'orderNo:"1",resetPassword:"",t={holidayViewTicketH5:"/p/index"}',
+     IDT.CLOUD_CRED_PASSWORD),
+    ("rentalcarsH5", 'orderNo:"1",db_pwd:"",t={rentalcarsH5:"/p/index"}',
+     IDT.CLOUD_CRED_PASSWORD),
+    ("taskCenterModel5", 'orderNo:"1",resetPassword:"",t={taskCenterModel5:"/p/index"}',
+     IDT.CLOUD_CRED_PASSWORD),
+    # 真实全文（normsib，405 字符）：命中裸关键词出口（stmt 含 authCookie），
+    # 而不是 is_server_cookie —— 两条出口都要被闸门覆盖。
+    ("在线建档h5需要unionId",
+     'console.log("authCookie========="),console.log(a),(S.some((function(e){return t.includes(e)}))'
+     '||-1!=t.indexOf("mix/auth/index")&&"lecshop"==n.model)&&(n.openId=v.getStorageSync("openId"),'
+     'n.wxAppId=w.wxAppId),-1!=t.indexOf("mix/auth/index")&&"lecshop"==n.model&&'
+     '(n.accessToken=r.Base64.encode(a)),t.includes("patient/hosCard/bind")&&'
+     '(n.unionId=v.getStorageSync("unionId"),console.log(n,"在线建档h5需要unionId"));',
+     IDT.SERVER_CRED_COOKIE),
+)
+
+
+def classify_before_fix22(v, stmt):
+    """把 fix22 的三态回报还原成改动前（(False, None)）—— 用于「改动前确实在风险桶」前置断言。"""
+    orig = C.is_identifier
+
+    def wrapped(s, stmt_):
+        r = orig(s, stmt_)
+        if r[0] is False and r[1] == IDT.ID_NOISE:
+            return (False, None)
+        return r
+
+    C.is_identifier = wrapped
+    try:
+        return classify(v, stmt)
+    finally:
+        C.is_identifier = orig
+
+
+def test_fix22_three_state_contract():
+    """`is_identifier` 的三态回报：只有 fix21 **新加**的命名排除回报 id_noise。"""
+    check("fix22 回报常量 == (False, id_noise)",
+          C.NAME_CLASS_REJECT == (False, IDT.ID_NOISE), str(C.NAME_CLASS_REJECT))
+    r = C.is_identifier("PASSPORT", 'o.userid = t.getStorageSync("PASSPORT")')
+    check("fix22 user 臂 name-like 排除（fix21 ③）回报 id_noise",
+          r == (False, IDT.ID_NOISE), str(r))
+    for v, stmt in (("delivererPhone", "b=_mz(z,'jn',['orderNo',1,'x'])"),
+                    ("FASTORDERNOLISTS", 'o.setData({orderNo:1})')):
+        r = C.is_identifier(v, stmt)
+        check(f"fix22 order 臂命名排除（fix21 ④）回报 id_noise: {v}",
+              r == (False, IDT.ID_NOISE), str(r))
+    r = C.is_identifier("businessCertificateCacheIdBase64", 'userId:"u",a=businessCertificateCacheIdBase64')
+    check("fix22 既有的两条 user 臂命名排除**不**回报（刻意边界，见报告 ②残留）",
+          r == (False, None), str(r))
+    check("fix22 真标识值仍返回 (True, id_user)",
+          C.is_identifier("37984296", 'uid:"37984296"') == (True, USER),
+          str(C.is_identifier("37984296", 'uid:"37984296"')))
+    check("fix22 无 identifier 语境的落选仍是 (False, None)",
+          C.is_identifier("abcdefgh", 'x="abcdefgh"') == (False, None))
+
+
+def test_fix22_risk5_rise_is_consumed():
+    """14 行（fix21 收严后从 risk 2~3 升到 risk 5 的名字类噪音）改判 id_noise。"""
+    for v, stmt, was in FIX22_ROWS:
+        got = classify(v, stmt)
+        before = classify_before_fix22(v, stmt)
+        check(f"fix22 已不再进风险桶、改判 id_noise: {v[:34]}",
+              got == {NOISE}, f"got={got}")
+        check(f"fix22 改动前确实在风险桶（复现升级）: {v[:30]}",
+              was in before, f"before={before}")
+
+
+def test_fix22_change_surface_is_bounded():
+    """改动面纪律：闸门**只在凭证判据接手时**生效，其余一律不动。"""
+    # ① 真 openid（28 位 o 开头、首小写驼峰形状）不能被闸门吃掉 —— 它由下游
+    #    is_openid_format 路径接手，必须仍是 id_user。
+    for v, stmt in (("obNfG5WWt5foSqPpAgoT9UgrfGpw", 'openid:"obNfG5WWt5foSqPpAgoT9UgrfGpw"'),
+                    ("ovKS05JrxKTIZrryu67uJyGoDIxs", 'openId: "ovKS05JrxKTIZrryu67uJyGoDIxs"')):
+        got = classify(v, stmt)
+        check(f"fix22 真 openid 仍判 id_user（不许降级成 id_noise）: {v[:20]}",
+              USER in got and NOISE not in got, f"got={got}")
+    # ② 带数字的真编号值：不在命名排除的射程内
+    for v, stmt, slug in (("37984296", 'uid:"37984296"', USER),
+                          ("130169571554503755", 'orderNo:"130169571554503755"', ORDER)):
+        got = classify(v, stmt)
+        check(f"fix22 真编号值判定不变: {v}", slug in got and NOISE not in got, f"got={got}")
+    # ③ 只被既有命名排除拒掉、且当前不产出任何类型的值：**仍然是「不产出」**，
+    #    不许因为本轮改动变成 id_noise（实测那会多改 406 行）。
+    for v, stmt in (("pageMyPhoneAuth", 'o.userid="x",u=pageMyPhoneAuth'),
+                    ("liveBindPhone", 'uid="x",f=liveBindPhone')):
+        got = classify(v, stmt)
+        check(f"fix22 「本来不产出」的值仍不产出: {v}", got == set(), f"got={got}")
+    # ④ 既有的同类误报（不是 fix21 造成的升级、由既有排除/更早判据造成）一律不动。
+    #    逐条钉住，防止后续无意放宽闸门（全量清单见报告 ③）。
+    for v, stmt, slug in (
+            ("userInfoV1", 'userId:"u",resetPassword:"",u=userInfoV1', IDT.CLOUD_CRED_PASSWORD),
+            ("baseUrlV2", 'o.userid="x",resetPassword:"",u=baseUrlV2', IDT.CLOUD_CRED_PASSWORD),
+            ("passWord2", 'uid="x",resetPassword:"",u=passWord2', IDT.CLOUD_CRED_PASSWORD),
+            ("线下会员cookie信息",
+             'console.log("线下会员cookie信息", e), i.globalData.offlineMembers.uid = e.data.uid;',
+             IDT.SERVER_CRED_COOKIE)):
+        got = classify(v, stmt)
+        check(f"fix22 既存同类误报不在本轮改动面内: {v[:24]}", slug in got, f"got={got}")
+    # ⑤ 裸关键词出口的**守卫顺序**：被值形守卫 continue 掉的值不许被闸门改成 id_noise。
+    got = classify("WXOFFICIAL", 'cookie:"1",userid:"x",a=WXOFFICIAL')
+    check("fix22 裸 cookie 出口的值形守卫仍先生效（WXOFFICIAL 不产出）", got == set(), f"got={got}")
 
 
 # =========================================================
