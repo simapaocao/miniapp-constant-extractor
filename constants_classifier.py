@@ -957,6 +957,15 @@ BUCKET_VALUE_BLACKLIST = (
 
 CODE_NAMING_PREFIXES = ("on", "get", "set", "is", "has", "can", "do", "will", "did")
 
+# 命中方式：按插入序迭代 + `in` 裸子串 + **首个命中即 return**（URL 分支与
+# process_generic_slash_prefixed_constant 第 8 步共用同一份判据）。
+# 因此**任何键只要包含更靠前的键，就永远不可达**（更靠前的键先命中并 return）。
+# fix20 ②：原顺序里 "oauth"（在 "auth" 之后）与 "payment"（在 "pay" 之后）就是这种
+# 死键 —— 三库实测首命中只有 login/auth/signin（1702）与 pay（1703），
+# oauth / payment 命中 0 次（test-result/fix20/issue2_quantify.out）。
+# 修法是让更专用的词排在它的子串之前，并加单测守住「无键被更靠前的键包含」这条性质。
+# 注意这次重排**不改变任何输出**：oauth/auth 同映射 SERVER_URL_AUTH、
+# payment/pay 同映射 SERVER_URL_PAYMENT，三库回放 0 变化（同报告）；它修的是死键本身。
 URL_SENSITIVE_KEYWORDS = {
     "webhook/send": IDT.WEBHOOK_URL,
     "cgi-bin/webhook": IDT.WEBHOOK_URL,
@@ -965,10 +974,10 @@ URL_SENSITIVE_KEYWORDS = {
     "bot/hook": IDT.WEBHOOK_URL,
     "login": IDT.SERVER_URL_AUTH,
     "signin": IDT.SERVER_URL_AUTH,
+    "oauth": IDT.SERVER_URL_AUTH,     # 必须先于 "auth"（"auth" in "oauth"）
     "auth": IDT.SERVER_URL_AUTH,
-    "oauth": IDT.SERVER_URL_AUTH,
+    "payment": IDT.SERVER_URL_PAYMENT,  # 必须先于 "pay"（"pay" in "payment"）
     "pay": IDT.SERVER_URL_PAYMENT,
-    "payment": IDT.SERVER_URL_PAYMENT,
     "admin": IDT.SERVER_URL_INTERNAL,
     "internal": IDT.SERVER_URL_INTERNAL,
     "debug": IDT.SERVER_URL_INTERNAL,
@@ -1038,6 +1047,49 @@ MINIAPP_COMPONENT_PREFIXES = (
     "/components/", "/component/", "/wxcomponents/", "/vant/",
     "/components-common/", "/commpents/",
 )
+
+# fix20 ③：组件引用路径的首段还有下面几族，原先全部漏网 —— 它们不含上面 6 个前缀，
+# 于是掉进第 8 步的裸子串匹配，成为 server_url_auth(risk4) /
+# miniapp_page_path_sensitive(risk3) 的**头部**（/@y/ppt/lib/user-authorize/index
+# 单值 2075 次、/ext-tee-passport/…/widgets/rt/Main 1054 次、/mainComponents/authPopup/authPopup 765 次）。
+# 收进来的依据是三库全量取证（值数 icp/pkgref/normsib，usingComponents 语境占比）：
+#   /@y/               41/72/53 值   100%/100%/100%（页面路由 0、API 标记 0）
+#   /mainComponents/   19/16/0 值   100%/100%/—
+#   /wigets/           22/21/20 值  100%/100%/100%
+#   /ext-tee-passport/  3/4/1 值    100%/100%/100%
+# （test-result/fix20/issue3_prefixes.out）
+# 注意：成员必须**全小写** —— 调用点是 `s_lower.startswith(...)`，写 "/mainComponents/"
+# 这种带大写的成员永远不会命中（本轮踩过：加了前缀但 /mainComponents/ 一族纹丝不动）。
+MINIAPP_COMPONENT_PREFIXES_EXT = (
+    "/@y/", "/maincomponents/", "/wigets/", "/ext-tee-passport/",
+)
+
+# 项目自建源码根**不能整族收**：/src/、/common/、/usercenter/ 下混着真接口与页面路由
+# （三库全量：usingComponents 语境占比只有 9.9%~34.9%；/common/getDictData、
+# /common/sendSmsVerifyCode、/common/getCaptcha 是真接口，/common/pages/login/login、
+# /src/pages/home/index 是页面路由，/usercenter/dashboard/index 是别的页面路径）。
+# 整族收会把它们一起搬进 1906（实测 /src/ 一族有 90/375/540 个页面路由形态的值）。
+# 改为**逐值要语境证据**：只有值附近确实出现 usingComponents 声明，才算组件引用。
+# 取证：加了这道语境门之后，三库该族被移动的值 100% 都能在自己的 snippet 里找到自己的
+# 路径（值 221/253/679，出现 3573/16171/22182），即证据确实指向该值而不是同语句的其它常量。
+MINIAPP_COMPONENT_CONTEXT_PREFIXES = (
+    "/src/", "/common/", "/usercenter/",
+)
+
+# 分包（/packages/…、/packageA/…、/subPackages/…）整体被 is_miniapp_page_route 认成
+# 页面路由（RE_MINIAPP_PAGE_ROUTE 里的 `^/package` 是前缀匹配），于是**分包内部的组件引用**
+# 也一起落进页面路径桶；其中带敏感词的那些正是 miniapp_page_path_sensitive(risk3) 的头部：
+#   /packages/async-minor/components/shop-pop-manager/index   552 次 icp / 308 次 pkgref
+#   /packages/async-feature-ext/rt/ext-tee-wsc-goods-biz-sku-manage-local/rt/Main  504/207
+# 这两族的差别是「路径里有没有组件目录段」：带 `/components/` 的那族取证干净
+# （三库 428/570/451 值、38,269/19,730/26,637 次，UC 语境 416/553/408 值，
+#  且这批值 100% 能在自己的 snippet 里找到自己 —— test-result/fix20/issue3_segment.out），
+# 所以按「组件目录段 + usingComponents 语境」单独放行；不带组件目录段的分包路径
+# （head #2 那条 /rt/…/Main）本轮不动，见 fix20 报告。
+MINIAPP_COMPONENT_DIR_SEGMENTS = (
+    "/components/", "/component/", "/components-common/", "/commpents/", "/wxcomponents/",
+)
+MINIAPP_PACKAGE_ROOTS = ("/package", "/subpackage", "/subpages")
 
 # 项目自建页面根目录 /page/（不是微信约定的 /pages/），只在「带查询参数」的入口认它。
 # /page/xxx?yyy= 是带参页面路由：实测三库 896 个带参值里 67.2% 上下文是 navigateTo/url
@@ -1223,6 +1275,35 @@ def is_w3c_namespace_url(url_full: str) -> bool:
     return bool(RE_W3C_NAMESPACE_URL.match(url_full.strip()))
 
 
+def has_url_userinfo_credential(cred_part: str) -> bool:
+    """URL 的用户信息段（第一个 `@` 之前的部分）是否为**真凭证** `user:password`。
+
+    fix20 ①：原判据只有 `"@" in url_body` + npm-scope/retina 两个排除，于是
+    「URL 里有任意 userinfo」= risk 5 / action=block 的 server_url_with_credentials。
+    三库并集实测 122 个去重值 / 734 次出现，逐条判读后 120 个值 / 728 次是误报：
+
+      - 遥测/Sentry DSN 形态 `https://<32hex>@host/project`  112 值 / 650 次（91.8%）
+        （`https://733e…@sentry.58.com/313`、`…@rum.17u.cn/317`、`…@report.url.cn/sentry/…`）
+        —— Sentry 的 DSN 公钥按设计就是**公开的前端写入键**，不带口令，
+        挂在 block 级告警上是高危误报；
+      - git 仓库 URL 只有用户名（`http://suguowei@192.9.180.91/drcBank/credit-applet.git`）
+        6 值 / 28 次；其余 2 值 / 50 次是拼接模板与垃圾（`https://a@b`、`https://uni-patient-@tag…`）。
+
+    真值只有 2 个值 / 6 次：`http://zhangxiaoyang:zxy081818@119.191.58.19:10080/…`、
+    `https://oath2:sps8yaQRN8nCAcLDNRBN@igit.ykbenefit.com/…`，两者都含 `user:password`。
+
+    判据取「含 `:` 且两侧非空」，与 URL 用户信息的语法一致（`user:password@`）：
+      - `@` 前无冒号 = 只有用户名（Sentry 公钥、git 用户名）→ 不是凭证；
+      - `user:@host` / `:pass@host`（RFC 3986 允许的退化写法）→ 没有可泄漏的口令，也不算。
+    RFC 3986 允许用户名/口令里出现百分号转义（`%3A`），故只看**未转义**的第一个 `:`；
+    百分号转义形态在三库 122 个值里为 0，不额外处理。
+    """
+    if ":" not in cred_part:
+        return False
+    user, _, password = cred_part.partition(":")
+    return bool(user) and bool(password)
+
+
 def process_prefixed_url(url_full: str, stmt: str, src: str, sid: int, res: list):
     """分类 URL"""
     # W3C/XML 命名空间不是接口端点（见 is_w3c_namespace_url）
@@ -1239,7 +1320,7 @@ def process_prefixed_url(url_full: str, stmt: str, src: str, sid: int, res: list
     if len(url_body) == 0 or not url_body[0].isalnum():
         return
 
-    # 带凭证的 URL: user:pass@host 格式
+    # 带凭证的 URL: user:password@host 格式
     if "@" in url_body:
         at_idx = url_body.index("@")
         cred_part = url_body[:at_idx]
@@ -1252,9 +1333,20 @@ def process_prefixed_url(url_full: str, stmt: str, src: str, sid: int, res: list
         is_retina = len(rest_part) >= 2 and rest_part[0].isdigit() and rest_part[1] == "x"
 
         if not is_npm_scope and not is_retina:
+            # 用户信息段一律不参与「主机 / 路径」分类（下面的 fs[0] 取主机），
+            # 这一点与改动前一致 —— 改动的是「哪些算凭证」，见 is_url_userinfo_credential。
             url_body = rest_part
-            append_result(res, IDT.SERVER_URL_WITH_CREDENTIALS, url_full, src, sid)
-            if ":" in cred_part:
+            # fix20 ①：只有真 `user:password` 才算带凭证 URL。
+            # 判据与量化见 has_url_userinfo_credential 的 docstring：收严后三库
+            # 1701 从 122 值/734 次降到 2 值/6 次，两个真值都保住，误伤 0。
+            # 其余值（Sentry DSN 公钥、git 用户名 URL…）**去向不变**：它们本来就
+            # 会把用户信息段剥掉后按主机/路径继续分类（实测三库 120 个值在本分支
+            # 之下都还会产出同一条次要标签），本次只是不再产出 1701 这一条。
+            if has_url_userinfo_credential(cred_part):
+                append_result(res, IDT.SERVER_URL_WITH_CREDENTIALS, url_full, src, sid)
+                # 顺带产出的 server_cred_password 与 1701 同条件：原本这条分支要求
+                # `":" in cred_part`，收严后该条件恒真（cred_part 含 ':' 正是 1701 的
+                # 判据），三库能触发它的本来也只有那 2 个真值（6 次），故保留配对产出。
                 append_result(res, IDT.SERVER_CRED_PASSWORD, url_full, src, sid)
 
     fs = url_body.split("/")
@@ -3058,6 +3150,61 @@ def pii_get_digit_type(s: str) -> str:
 RE_MINIAPP_PAGE_ROUTE = re.compile(r"/pages/|^/package|^/subpackage|^/subpages", re.I)
 
 
+# 编译器身份上下文：小程序编译产物里 `__wxAppCode__['pages/x/y.wxml'] = …` 这类注册表键、
+# 以及 `__wxAppCurrentFile__ = 'pages/x/y.wxss'`、`__wxAppFile__` 这类当前文件标记。
+RE_COMPILER_IDENTITY_CONTEXT = re.compile(
+    r"__wxappcode__|__wxappcurrentfile__|__wxappfile__", re.I)
+
+# fix20 ④：这些后缀在编译产物里是**模板/样式/配置**文件身份，两边读法（字面 require 路径 /
+# 宽义的「前端模块引用」）下都不是模块引用：
+#   `pages/account/reserve.json` ← `__wxAppCode__['pages/account/reserve.json'] = {…}`
+#   `pages/account/login/index.wxml` / `.wxss` ← 编译模板/样式（setCssToHead、__wxAppCurrentFile__）
+# 三库实测：1906 里「全部 snippet 都是编译器身份语境」的值 = icp 34,063 / pkgref 31,143 /
+# normsib 51,092（占桶 55.6%/49.8%/50.6%），其中 .wxml/.json/.wxss 合计约 79%
+# （.wxml 31%/30%/31%、.json 31%/29%/29%、.wxss 18%/18%/18%）；出现次数口径见
+# test-result/fix20/issue4_pure.out。
+# **故意不包含 .js**：`__wxAppCode__['pages/x/index.js'] = function(){…}` 里的值就是编译后
+# 模块的模块 id（同族里还有 343/786/2510 个值的同语境里直接出现 require/import），
+# 按字面与宽义都可能算「模块路径」，证据不足以移走 —— 这一条是本处刻意留下的残余（见报告）。
+MINIAPP_COMPILER_NONMODULE_EXTENSIONS = (".wxml", ".wxss", ".json")
+
+
+def is_compiler_file_identity(s: str, stmt: str) -> bool:
+    """值是否为「编译器身份串里的非模块文件」——模板/样式/配置文件身份。
+
+    判据 = 语境里出现编译器身份标记 + 值以 .wxml/.wxss/.json 结尾。
+    归置见 perform_constant_classifying 的调用点：miniapp_noise(1907)。
+    """
+    if not RE_COMPILER_IDENTITY_CONTEXT.search(stmt or ""):
+        return False
+    return s.lower().endswith(MINIAPP_COMPILER_NONMODULE_EXTENSIONS)
+
+
+def has_usingcomponents_context(stmt: str) -> bool:
+    """语句里是否出现 usingComponents 组件声明（大小写不敏感）。
+
+    用于 fix20 ③：项目自建源码根（/src/、/common/、/usercenter/）下的斜杠路径，
+    只有落在组件声明附近才算组件引用（见 MINIAPP_COMPONENT_CONTEXT_PREFIXES 的取证）。
+
+    只认这一个标记、不做更复杂的结构解析：三库实测该标记在该族上从未误指向别的值
+    —— 被移动的 1153 个值全部能在自己的 snippet 里找到自己的路径
+    （test-result/fix20/issue3_mixed.out）。stmt 是 512 字符窗口，可能包含同一语句
+    其它常量的内容（见 perform_constant_classifying 的窗口说明），这是本判据已知的
+    精度上界；若把范围放宽到「任意前缀 + 该标记」，被移动的值会从 1.1k 涨到 30k+
+    （icp 单库 3836 值 / 139,488 次，绝大多数来自 miniapp_api_params），故不再放宽。
+    """
+    return "usingcomponents" in (stmt or "").lower()
+
+
+def is_subpackage_component_path(s_lower: str) -> bool:
+    """分包根下的**组件引用**路径（分包根 + 组件目录段，见 MINIAPP_COMPONENT_DIR_SEGMENTS）。
+
+    只用于 fix20 ③ 的语境放行：调用方还必须证到 usingComponents 语境。
+    """
+    return (s_lower.startswith(MINIAPP_PACKAGE_ROOTS)
+            and has_keyword_substring(s_lower, MINIAPP_COMPONENT_DIR_SEGMENTS))
+
+
 def is_miniapp_page_route(s: str, with_page_dir: bool = False) -> bool:
     """值是否为小程序页面/分包路由形态（不是后端接口路径）。
 
@@ -3382,6 +3529,28 @@ def process_generic_slash_prefixed_constant(s: str, stmt: str, src: str, sid: in
     if s_lower.startswith(MINIAPP_COMPONENT_PREFIXES) and not has_keyword_substring(s_lower, MINIAPP_API_PATH_PATTERNS):
         append_result(results, IDT.MINIAPP_PATH_MODULE, s, src, sid)
         return
+
+    # 6b. fix20 ③：另外几族组件引用首段（+ 项目自建源码根下的 usingComponents 语境）。
+    #     放在第 8 步（敏感关键字）之前 —— 这些值里大量带 auth/login/pay/admin 段
+    #     （user-authorize / authPopup / authorize / login-mask / pay-payment），
+    #     正是它们把 1702/1703/1901 的头部占满的原因。
+    #     页面路由形态不走这条（/src/pages/... 仍是页面路由，交给第 8/9 步），
+    #     API 标记同样排除，与第 6 步口径一致。
+    if not has_keyword_substring(s_lower, MINIAPP_API_PATH_PATTERNS):
+        # 6b-1/6b-2：首段是组件库/自建源码根。页面路由形态不走这条
+        # （/src/pages/...、/common/pages/... 仍是页面路由，交回第 8/9 步）。
+        if not is_miniapp_page_route(s) and (
+                s_lower.startswith(MINIAPP_COMPONENT_PREFIXES_EXT) or (
+                    s_lower.startswith(MINIAPP_COMPONENT_CONTEXT_PREFIXES)
+                    and has_usingcomponents_context(stmt))):
+            append_result(results, IDT.MINIAPP_PATH_MODULE, s, src, sid)
+            return
+        # 6b-3：分包里的组件引用 —— 分包整体是「页面路由形态」，必须单独放行，
+        # 所以这里不再加 is_miniapp_page_route 守卫，改由「组件目录段」区分
+        # （分包里的页面 /packages/x/pages/y 不含组件目录段，不受影响）。
+        if is_subpackage_component_path(s_lower) and has_usingcomponents_context(stmt):
+            append_result(results, IDT.MINIAPP_PATH_MODULE, s, src, sid)
+            return
 
     # 7. 带查询参数的 API 路径
     if "?" in s and "=" in s:
@@ -3902,6 +4071,18 @@ def perform_constant_classifying(statements: List[str], constants: List):
         # cloud_cred_cookie 2 次（另 saas_analytics_key(1) 4 次）—— **没有新噪音进 risk>=4 桶**
         # （纯丢弃不会新增产出，实测见 test-result/fix14/f_before_after.py）。
         if is_toolchain_generated_artifact(s):
+            continue
+
+        # =========================================================
+        # 编译器身份串里的模板/样式/配置文件身份（fix20 ④）—— 结构性拦截
+        # =========================================================
+        # 与上面几处「编译产物」拦截同一族，但归置不同：这里**不丢弃**，改判
+        # miniapp_noise(1907，"Miniapp internal noise"，risk 0) —— 值本身形态完好
+        # （是小程序的文件路径），保留便于回溯文件清单，只是它不是业务常量、
+        # 更不是模块引用。判据与量化见 is_compiler_file_identity 的注释。
+        # `.js` 身份（编译模块 id）刻意留在原处（1906），理由同注释。
+        if is_compiler_file_identity(s, stmt):
+            append_result(res, IDT.MINIAPP_NOISE, s, src, sid)
             continue
 
         # =========================================================
