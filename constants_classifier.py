@@ -279,6 +279,100 @@ def ip_get_ip_type(ip: tuple) -> str:
 
 
 # =========================================================
+# fix18 ①：四段点分数字 ≠ IP（证书 OID / 四段版本号）
+# =========================================================
+# ip_check_address 只做**形态**检查（四段、每段 ≤255），所以下面这些每段都 ≤255 的
+# 四段数字全被判成公网 IP。backend_ip_public 里的非 IP 值（用户报的规模：icp 21 值/704 次、
+# pkgref 35 值/584 次、normsib 38 值/1217 次，在 normsib 该类型里占出现次数的 37%）
+# 分两类成因（本轮实测的离开值见 test-result/fix18/j_replay.out）：
+#   ①a X.509 证书扩展 OID：`this.oid="2.5.29.15"` / `keyUsage:"2.5.29.15"` /
+#      `certificatePolicies:"2.5.29.32"`，出处是 jsrsasign / wx_rsa 这类证书解析库。
+#      三库 75 个值 / 2407 次，全部落在 id-ce 弧 2.5.29.*，且全部是**裸四段**形态。
+#   ①b 四段版本号：`ext/userVersion:"3.176.6.101"` / `appVersion:"1.3.3.100"` /
+#      `version2Uint32("8.0.54.61","android")` / `version:"11.9.0.255"`。
+#      `2.x`/`3.x` 恰好是 RIPE(2.0.0.0/8) 与 AWS(3.0.0.0/8) 的真实分配段，所以
+#      形态判据单独用会误伤，必须靠语境分辨。
+#
+# 判据取 (c) 组合，两条臂各自要「证据」：
+#   形态臂：值本体落在 id-ce 弧（2.5.29.）—— 该弧下一切 4 段值在三库里 100% 是证书
+#           扩展 OID（对照：同弧的 5 段 `2.5.29.37.0` / `2.5.29.32.0` 今天就在 pii_noise）。
+#   语境臂：**只对裸值生效**，且要求证书键 / version 键紧接在值左边（[:=(] 直接接值），
+#           避免整行压缩代码里远处出现的 certificate/version 字样把真端点带走。
+# 归置：不走 IP 分支（交给既有 `_is_oid_format` 兜底 → pii_noise(0)），不是丢弃也不是
+# backend_ip_noise —— 依据是 5 段 OID 与「段值 >255 的四段数字」（3.2.19.333 /
+# 8.0.x 长段版本号）今天已经都在 pii_noise：这里只是让 ≤255 的子集回到同一归宿，
+# 不新造标签、不改桶语义。误伤实测见 test-result/fix18/ 报告。
+RE_X509_ID_CE = re.compile(r"^2\.5\.29\.")
+# 键名左侧要求「词边界」：否则 `avoid:` 里的 oid、`server:` 里的 ver 会误命中。
+# 键名右侧允许被引号/括号包住（`"userVersion":"1.2.3.4"`、`version2Uint32("8.0.56.56"`），
+# 值左侧的引号可有可无：stmt 窗口到值本体为止。
+RE_OID_KEY_BEFORE = re.compile(
+    r"(?:^|[^\w$])(?:oid|keyusage|extkeyusage|extendedkeyusage|basicconstraints|"
+    r"subjectaltname|subjectkeyidentifier|authoritykeyidentifier|certificatepolicies|"
+    r"inhibitanypolicy|nameconstraints|policyconstraints|crldistributionpoints|"
+    r"freshestcrl|x509|asn1)\s*[\"']?\s*[\)\]]?\s*[:=(]\s*(?:[\"']\s*)?$", re.I)
+RE_VER_KEY_BEFORE = re.compile(
+    r"(?:^|[^\w$])(?:version\w*|ver|(?-i:[a-z][a-z0-9]*Version\w*))\s*[\"']?\s*[\)\]]?\s*"
+    r"[:=(]\s*(?:[\"']\s*)?$", re.I)
+
+
+def _has_non_ip_key_context(s: str, stmt: str, width: int = 48) -> bool:
+    """s 在 stmt 中**任一次**出现的紧邻左语境是否为证书键 / version 键。
+
+    只取紧邻的 48 字符：压缩代码整行里远处出现的 certificate/version 字样不该把
+    真端点带走（实测三库 0 例）。
+    """
+    if not stmt:
+        return False
+    start = 0
+    while True:
+        i = stmt.find(s, start)
+        if i < 0:
+            return False
+        ctx = stmt[max(0, i - width):i]
+        if RE_OID_KEY_BEFORE.search(ctx) or RE_VER_KEY_BEFORE.search(ctx):
+            return True
+        start = i + 1
+
+
+def is_dotted_number_not_ip(ip_part: str, stmt: str) -> bool:
+    """四段数字但**不是 IP**：X.509 证书扩展 OID 或四段版本号（fix18 ①）。
+
+    只用于裸值路径（process_standalone_ip）。URL 形态的 host 不在此列：
+    带 scheme/路径的 host 是「端点声明」，且三库实测 0 例 OID 弧 host。
+    """
+    return bool(RE_X509_ID_CE.match(ip_part) or _has_non_ip_key_context(ip_part, stmt))
+
+
+# =========================================================
+# fix18 ②：回环与未指定地址（无基础设施信息量）→ IP 噪声(0)
+# =========================================================
+# 127.0.0.1 是 backend_ip_private 的头部值（normsib 240 次、三库 136 值/935 次）：
+# 开发/联调/mock 配置与「本机 hostname 判断」写死的回环地址，每个应用都有，作为
+# 「内网 IP 发现」没有分析价值。0.0.0.0 语义不同（未指定 / 监听全部接口，不是回环），
+# 但作为 URL host 同样不指向任何可分析目标，且今天被 ip_get_ip_type 判成 PUBLIC
+# （不可路由，属于类型判错）。
+# 归置选 backend_ip_noise(0)：这两者是**货真价实的 IP 字面量**（属于本类组成员），
+# 只是没有信息量 —— 用本类组的 risk0 桶承接，语义贴合、不产生告警，值仍可回溯
+# （如 `http://127.0.0.1:19952/Home/HidReadCard` 这类本机 agent 端点）。
+# 与 ① 归置不同的理由：OID/版本号**根本不是 IP**，放 IP 噪声桶会把「IP噪声」这个名字
+# 扭曲成「OID 桶」；回环/未指定则是 IP，放本类组的噪声桶名实相符。
+# ::1 与 localhost 不在此列：ip_check_address 只认四段数字，它们在结构上到不了
+# backend_ip_*（三库实测 0 值），不为不存在的形态写分支。
+def is_loopback_or_unspecified(ip: tuple) -> bool:
+    """回环 127.0.0.0/8 或未指定地址 0.0.0.0"""
+    if not isinstance(ip, tuple) or len(ip) != 4:
+        return False
+    try:
+        octets = [int(p) for p in ip]
+    except ValueError:
+        return False
+    if octets[0] == 127:
+        return True
+    return octets == [0, 0, 0, 0]
+
+
+# =========================================================
 # 前缀匹配字典
 # =========================================================
 # fmt: off
@@ -1171,6 +1265,10 @@ def process_prefixed_url(url_full: str, stmt: str, src: str, sid: int, res: list
     server_name = fs[0].split(":")[0]
     ip_addr_tuple = ip_check_address(server_name)
     if ip_addr_tuple:
+        # fix18 ②：回环/未指定地址（http://127.0.0.1:19952/Home/…）无基础设施信息量
+        if is_loopback_or_unspecified(ip_addr_tuple):
+            append_result(res, IDT.BACKEND_IP_NOISE, url_full, src, sid)
+            return
         ip_type = ip_get_ip_type(ip_addr_tuple)
         slug = {
             "PRIVATE": IDT.BACKEND_IP_PRIVATE,
@@ -1220,6 +1318,14 @@ def process_standalone_ip(s: str, stmt: str, src: str, sid: int, res: list) -> b
     ip_tuple = ip_check_address(ip_part)
     if not ip_tuple:
         return False
+    # fix18 ①：形态是四段数字，但语境/弧位说明它不是 IP（证书 OID / 四段版本号）。
+    # 返回 False = 未匹配，交回通用链由既有 _is_oid_format 兜底 → pii_noise(0)。
+    if is_dotted_number_not_ip(ip_part, stmt):
+        return False
+    # fix18 ②：回环 127.0.0.0/8 与未指定地址 0.0.0.0 —— 是 IP 但没有信息量 → IP 噪声(0)。
+    if is_loopback_or_unspecified(ip_tuple):
+        append_result(res, IDT.BACKEND_IP_NOISE, s, src, sid)
+        return True
     ip_type = ip_get_ip_type(ip_tuple)
     if ip_type == "PRIVATE":
         append_result(res, IDT.BACKEND_IP_PRIVATE, s, src, sid)
