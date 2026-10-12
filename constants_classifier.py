@@ -456,6 +456,90 @@ CLOUD_PASSWORD_CONTEXT_WORDS = {
     "mqpassword", "mq_password", "rabbitmqpassword", "kafkapassword",
 }
 
+# ---------------------------------------------------------
+# 路径/路由里的 password 不是密码语境（fix16 ①）
+# ---------------------------------------------------------
+# 病根：has_cloud_password_context 的**长词**（password / passwd / db_pwd …）走裸子串匹配，
+# 于是页面路径里的 password 段也算语境：
+#     o.disabled=!1,e.index.__f__("log","at pages/login/passwordLogin.vue:484","err3241",t)
+#     -> 值 err3241（日志 tag）被判 cloud_cred_password(1203, risk5)
+# 三库实测该桶 2,847 个「值×上下文」对里 304 对含路径式 password（`pages?/[^ ]*password`）。
+#
+# 判据只动**语境侧**，且只挖掉「明显在路径上」的那些出现，两种情况之一：
+#   a) 关键词被 `/` 夹住（`pages/login/password` / `password/index.js`）——
+#      路径段的分隔符就在紧邻两侧；`login/passwordLogin.vue` 也落在这一条。
+#   b) 关键词落在**含 `/` 的引号串**里（`"/pages/setPassword/setPassword?x=1"`）——
+#      覆盖 `setPassword` / `updatePwd` 这类驼峰式路径段（它们的左邻是字母，a) 够不到）。
+# 例外的例外（**必须保留**）：关键词处于键名/赋值位置（后面跳过引号空白紧跟 `:` 或 `=`）
+# 时一律不动 —— 这是「赋值的仍算」的落地，也保住 DSN 形态 `…?password=`。
+#
+# 实测（三库真实 (值,上下文) 回放，见 test-result/fix16/）：
+#   语境闸门 T->F 343 对；落桶 1203 消失 159 对；按 data_item 复算：57 项 / 49 值 /
+#   158 次出现离开 1203，去向 丢弃 26、other 19、pii_noise 11、platform_access_token 1，
+#   逐条人工判读**全部**是路径/URL 片段/chunk 名/图片名/日志 tag；
+#   fix12 人工核定的 29 个在库真阳性误伤 0（误伤标尺见 c_ccp_before_after.out）。
+#
+# 被否决的更宽方案：「关键词所在的空白 token 含 `/` 就挖」会把真键名一起带走 ——
+#   `…url:"/pages/x"… ,pwdType:"recordPsw"…` 里的 pwdType 与 URL 同处一个 minified token，
+# 该方案比本判据多踢 71 个值，其中 `qrcode_19_noPowerError` 一类正是靠 pwdType 开闸的，
+# 故只取 a) ∪ b)（见 test-result/fix16/b_ccp_flip_R6.out 与 R8 的差集）。
+RE_CLOUD_PWD_WORD_ROOT = re.compile(r"password|passwd|pwd", re.I)
+# 键名/赋值尾巴：`password:` / `password =` / `password="`。`=` 还要排掉 `==` `===` `=>`。
+RE_CTX_KEY_OR_ASSIGN_TAIL = re.compile(r"[\"'\t ]*[:=]")
+
+
+def _is_key_or_assign_tail(stmt: str, end: int) -> bool:
+    """关键词之后（跳过引号/空白）紧跟 `:` 或 `=` —— 键名/赋值位置，不参与挖掘。"""
+    m = RE_CTX_KEY_OR_ASSIGN_TAIL.match(stmt, end)
+    if not m:
+        return False
+    if stmt[m.end() - 1] == ":":
+        return True
+    return stmt[m.end():m.end() + 1] not in ("=", ">")     # == / === / => 是比较与箭头
+
+
+def _inside_quoted_path(stmt: str, pos: int) -> bool:
+    """pos 是否落在「含 `/` 的引号串」内。
+
+    朴素配对：左侧同种引号数为奇即认为在串内（窗口可能从串中间开始，此时偏保守：
+    数不出来就不挖，不会误挖）。串内没有 `/` 则不算路径。
+    """
+    for q in ('"', "'"):
+        if stmt.count(q, 0, pos) % 2:
+            close = stmt.find(q, pos)
+            return close > 0 and "/" in stmt[stmt.rfind(q, 0, pos) + 1:close]
+    return False
+
+
+# ⚠️ 本函数**故意定义在 has_user_id_context / has_cloud_password_context 之前**：
+# test-result/validate_uid_pwd_region.py 用「源码擦除」构造修复前模块，擦除范围正好覆盖
+# 那两个 wrapper；把它放进那个范围会连这条判据一起擦掉，而该脚本的口径是「没被 REVERTS
+# 关掉的改动对 before/after 两侧一视同仁」。
+def strip_path_password_context(stmt: str) -> str:
+    """把路径/路由里的 password 词挖成等长空白（保持偏移），其余位置逐位不动。
+
+    只挖 CLOUD_PASSWORD_CONTEXT_WORDS 的词根出现（这些词**全部**含 password/passwd/pwd
+    之一），且仅在「被 `/` 夹住」或「落在含 `/` 的引号串里」时挖；键名/赋值位置不挖。
+    空语句 / 无命中都是原样返回（调用方拿到的一定是 str）。
+    """
+    if not stmt:
+        return stmt
+    out = None
+    for m in RE_CLOUD_PWD_WORD_ROOT.finditer(stmt):
+        start, end = m.start(), m.end()
+        if _is_key_or_assign_tail(stmt, end):
+            continue
+        prev_slash = start > 0 and stmt[start - 1] == "/"
+        next_slash = end < len(stmt) and stmt[end] == "/"
+        if not (prev_slash or next_slash or _inside_quoted_path(stmt, start)):
+            continue
+        if out is None:
+            out = list(stmt)
+        for i in range(start, end):
+            out[i] = " "
+    return stmt if out is None else "".join(out)
+
+
 CLOUD_PASSWORD_PLACEHOLDERS = (
     "xxx", "***", "password", "123456", "admin", "root", "test",
     "null", "none", "empty", "undefined", "default",
@@ -596,8 +680,11 @@ def has_cloud_password_context(stmt: str, value: str) -> bool:
 
     value 参与剥值（见 external_context）：值自身含 password/pwd 时不再能单独定罪，
     值形一侧由 is_segmented_identifier_name 承担（fix12）。`value` 无默认值，理由同上。
+
+    另经 strip_path_password_context 挖掉路径/路由里的 password（fix16 ①）：页面路径、
+    URL 片段里的 password 段不是密码语境，赋值与键名位置不受影响。
     """
-    context = external_context(stmt, value)
+    context = strip_path_password_context(external_context(stmt, value))
     return (has_keyword_in_context_strict(context, "pwd")
             or has_keyword_in_context(context, CLOUD_PASSWORD_CONTEXT_WORDS - {"pwd"}))
 
@@ -2051,6 +2138,13 @@ RE_SINGLE_SEGMENT_SYNTAX_PREFIX = re.compile(r"^(?:[#.]|===|_)")
 # 「cookie名 + 非空值」只有 1 值 —— 非空值一律不动（见 test-result/risk5_struct/cookie_name_only.py）。
 RE_COOKIE_NAME_NO_VALUE = re.compile(r"^[\"']?[A-Za-z][A-Za-z0-9_.\-]*[\"']?=\s*$")
 
+# fix16 ②：cookie 名里的「cookie 类词」。名字在这一族里 + 右侧为空 = 强证据说明它是 cookie 名，
+# 而不是靠「表里有没有」这一条孤证。三库头部残留：ASP.NET_SessionId= / temp_token_auth= /
+# token_auth= / auth_token= / login_token= / bujiang_session_id= / access_token= /
+# session_id= / fsidCount= …（判据只放宽**名字侧**，`=` 右侧非空的一律不动。）
+COOKIE_NAME_WORDS = ("token", "session", "sid", "auth", "cookie", "login",
+                     "ticket", "jwt", "credential")
+
 
 def is_single_segment_identifier_name(s: str) -> bool:
     """值形是否为「单段词形标识符 / 语法片段前缀」——这一类永远不是凭证材料。
@@ -2069,10 +2163,32 @@ def is_single_segment_identifier_name(s: str) -> bool:
 
 
 def _is_cookie_name_without_value(s: str, cookie_name_keywords: tuple) -> bool:
-    """cookie **名** + 空值（`JSESSIONID=`）—— 见 RE_COOKIE_NAME_NO_VALUE 的注释。"""
+    """cookie **名** + 空值（`JSESSIONID=`）—— 见 RE_COOKIE_NAME_NO_VALUE 的注释。
+
+    fix16 ② 放宽了「名字」那一半：除关键词表之外，**名字含 cookie 类词**
+    （COOKIE_NAME_WORDS：token/session/sid/auth/cookie/login/…）也算。
+    只认表里的名字会漏掉 `auth_token=` / `temp_token_auth=` / `ASP.NET_SessionId=` 等
+    三库头部值（实测该形态 111 个 data_item / 777 次出现在表外）。
+
+    但**名字还必须是词形标识符**（is_segmented_identifier_name /
+    is_single_segment_identifier_name）：`=` 右侧为空并不等于名字 ——
+    base64 的 `=` 填充也是同一个形状，`LmF3LWNvb2tpZS1iYW5uZXI=` 就是桶里的真值。
+    「任何 `名=` 空值」这条更宽的写法（不带形态判据）实测会吃掉 4 个 base64 填充值
+    （见 test-result/fix16/e_cookie_widen.out 的 W4 对照组），故不采用。
+
+    实测（三库 1,750 个 data_item 真实 (值,上下文) 回放）：1604 净减 67 值 / 629 次出现，
+    全部落到「丢弃」；右侧非空被碰 0 个；base64 填充真值丢失 0 个。
+    """
     if not RE_COOKIE_NAME_NO_VALUE.match(s):
         return False
-    return s.split("=", 1)[0].strip().strip("\"'").lower() in cookie_name_keywords
+    name = s.split("=", 1)[0].strip().strip("\"'")
+    name_lower = name.lower()
+    if name_lower in cookie_name_keywords:
+        return True
+    if not any(w in name_lower for w in COOKIE_NAME_WORDS):
+        return False
+    return (is_segmented_identifier_name(name)
+            or is_single_segment_identifier_name(name))
 
 
 def is_cloud_password(s: str, stmt: str) -> bool:
