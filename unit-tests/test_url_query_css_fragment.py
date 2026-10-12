@@ -183,8 +183,12 @@ _PWD_STMT = ("var u = e.default.host + '/oauth/token?grant_type=password&usernam
 def test_end_to_end_dropped():
     """命中即丢弃：不产出任何类型（连 other 都不产出）。"""
     assert _classify("&password=", _PWD_STMT) == []
+    # ⚠️ fix16 ①（路径语境）也独立挡住了它的密码语境：`grant_type=password` 落在
+    # `/oauth/token?grant_type=password&username=` 这个**含 `/` 的引号串**里，
+    # 那是个 OAuth grant 名，不是口令。故关掉本拦截后的落点由 cloud_cred_password(5)
+    # 变成 other(0)。期望值由探针实测后写死。
     assert _classify("&password=", _PWD_STMT, interceptor_on=False) == \
-        [IDT.CLOUD_CRED_PASSWORD], "实测：关掉拦截时 &password= 被判 cloud_cred_password"
+        [IDT.OTHER], "实测：关掉拦截时 &password= 落 other（fix16 ① 之前是 cloud_cred_password）"
 
     ctx2 = "Z([[4],[[5],[[4],[[5],[[5],[1,'^stillPassword']]]]]])"
     assert _classify("^stillPassword", ctx2) == []

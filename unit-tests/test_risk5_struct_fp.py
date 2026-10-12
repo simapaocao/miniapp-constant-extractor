@@ -253,6 +253,12 @@ def test_cookie_name_without_value_goes_away():
     是有意的保守边界：放宽成「任何 `名=` 空值」会把 base64 带 `=` 填充的真值
     （如 `LmF3LWNvb2tpZS1iYW5uZXI=`）一起吞掉。
     已知残留（不在关键词表，本轮不收）：`SessionWsid=`(32 次) / `_FSESSIONID=`(15 次)。
+
+    ⚠️ fix16 ② 把「名字」那一半从「在关键词表里」放宽成
+    「在表里 **或** 名字含 cookie 类词（token/session/sid/auth/…）**且** 是词形标识符」。
+    因此下面 `mytoken=` 一行由「True（不许碰）」改成「命中（该收）」—— 它是 cookie 名不是
+    值；`LmF3LWNvb2tpZS1iYW5uZXI=` 仍必须**不命中**（形态判据挡住，这是本轮红线）。
+    新的完整边界在本文件末尾的 fix16 段与 unit-tests/test_risk5_path_ctx_cookie_name.py。
     """
     for v in ("JSESSIONID=", "PHPSESSID=", "sessionid=", "SessionId="):
         assert C._is_cookie_name_without_value(v, C.SERVER_COOKIE_NAME_KEYWORDS), v
@@ -261,9 +267,15 @@ def test_cookie_name_without_value_goes_away():
     assert not C._is_cookie_name_without_value("JSESSIONID=abcd1234efg",
                                                C.SERVER_COOKIE_NAME_KEYWORDS)
     assert C.is_server_cookie("JSESSIONID=abcd1234efg", "cookie: JSESSIONID=abcd1234efg")
-    # 名字不在关键词表里的不许被碰
-    assert not C._is_cookie_name_without_value("mytoken=", C.SERVER_COOKIE_NAME_KEYWORDS)
+    # fix16 ②：名字含 cookie 类词 + 词形标识符 -> 命中（`mytoken` 是名不是值）
+    assert C._is_cookie_name_without_value("mytoken=", C.SERVER_COOKIE_NAME_KEYWORDS)
+    # 名字既不在表里、也不含 cookie 类词的，不许被碰
+    assert not C._is_cookie_name_without_value("banner=", C.SERVER_COOKIE_NAME_KEYWORDS)
+    assert not C._is_cookie_name_without_value("utm_source=", C.SERVER_COOKIE_NAME_KEYWORDS)
+    # base64 带 `=` 填充的真值（含 cookie 类词的形态也没用，形态判据挡住）
     assert not C._is_cookie_name_without_value("LmF3LWNvb2tpZS1iYW5uZXI=",
+                                               C.SERVER_COOKIE_NAME_KEYWORDS)
+    assert not C._is_cookie_name_without_value("aXNsYW1pYy1zaWQ=",
                                                C.SERVER_COOKIE_NAME_KEYWORDS)
 
 
