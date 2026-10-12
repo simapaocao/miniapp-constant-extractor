@@ -2261,8 +2261,39 @@ def is_name_like_identifier_value(s: str) -> bool:
     return (not s.isascii()) or s.isalpha()
 
 
+# fix22：identifier 臂「按命名形态拒掉」的回报值（口径见 is_identifier 的 docstring）。
+#
+# 病根：fix21 ③④ 把一批「名字/文案形态」的值从 identifier 臂排除出去，但这些值**被排除后
+# 继续往下走**，落到下游的凭证判据上 —— 三库用真实 (值, 上下文) 重跑实测 14 行 / 17 次
+# （cloud_cred_password 13 行、server_cred_cookie 1 行）由 risk 2~3 升到 risk 5，与 fix11
+# 「收严支付参数后 220 值改判 cloud_cred_password」同型：**收严一处会让下游的既存误报显形**。
+# 这批值是**已知的名字类噪音**（13 行进 cloud_cred_password：`ByPhoneRegisteredUsers`、
+# `IdCardOcrAsync`、`VerifyPhoneRegister`、`MobileNumberToLoginOrRegistered`(两库)、
+# `PhoneNumber`、`csairlugtransH5`/`emallH5Sichuan`/`holidayBocheH5`/`holidayPostScheduleH5`/
+# `holidayViewTicketH5`/`rentalcarsH5`/`taskCenterModel5` 七个页面别名；
+# 1 行进 server_cred_cookie：`在线建档h5需要unionId`），不该出现在任何风险桶里。
+#
+# 归置：改判既有的 id_noise(2505, risk 0) —— 不新增类型、不丢弃（与 fix21 ① 同型）。
+# ⚠️ 归置**只在调用点、且只在凭证判据真要接手时**发生（见 perform_constant_classifying
+# 里的 fix22 注释）。反过来，若在这里直接 `return (True, IDT.ID_NOISE)`，改动面会从 14 行
+# 涨到 422 行：多出的 408 行里 406 行现在**根本不产出任何类型**（丢弃 → id_noise），
+# 另有 2 行 id_device 值的标签集合被改（其中 `获取用户OPENID失败` 的首标签会从
+# id_device 变成 id_noise）—— 都属于「改动面超出本轮授权」的范围，故不做。
+#
+# 刻意**不**接进闸门的两条命名排除（user 臂的 `islower()+isalpha()` 与首小写驼峰）：
+# 它们是改动前就有的判据，把它们一起接上会额外翻转 82 行**既存**的同类误报
+# （`userInfoV1` / `passWord2` / `apiPlatformUrl10093` …，全部已是 risk 5 的误报，
+# 不是本轮 fix21 造成的升级）—— 同样属于本轮授权之外，留待专项处理。
+NAME_CLASS_REJECT = (False, IDT.ID_NOISE)
+
+
 def is_identifier(s: str, stmt: str) -> tuple:
-    """检测是否为标识符，返回 (是否匹配, 分类ID)"""
+    """检测是否为标识符，返回 (是否匹配, 分类ID)。
+
+    fix22 的三态约定：**只因「命名形态排除」落选**时返回 `NAME_CLASS_REJECT`
+    = (False, IDT.ID_NOISE)，即「不是标识值，而且是已知的名字类噪音」；其余落选仍是
+    (False, None)。调用点据此在下游凭证判据要接手时把它 consuming 成 id_noise。
+    """
     s_len = len(s)
 
     if is_placeholder_value(s) or _is_asn1_oid_hex(s):
@@ -2308,19 +2339,22 @@ def is_identifier(s: str, stmt: str) -> tuple:
             if s[0].islower() and any(c.isupper() for c in s):
                 return (False, None)
             # fix21 ③：排除「名字/文案」形态（中文串、全字母的常量名与状态名）
+            # fix22：这条是 fix21 **新加**的排除，落选时回报 NAME_CLASS_REJECT
+            # （上面两条更早的命名排除是改动前就有的，本轮不动其行为，理由见常量注释）。
             if is_name_like_identifier_value(s):
-                return (False, None)
+                return NAME_CLASS_REJECT
             return (True, IDT.ID_USER_IDENTIFIER)
 
     if has_keyword_in_context(stmt, ORDER_ID_KEYWORDS):
         if check_length_range(s, 12, 64) and (s.isdigit() or s.isalnum()):
             # fix21 ④：order 分支原先一条命名模式排除都没有，与 id_user 分支同口径补齐
+            # fix22：这三条都是 fix21 新加的，落选即「名字类噪音」
             if s.islower() and s.isalpha():
-                return (False, None)
+                return NAME_CLASS_REJECT
             if s[0].islower() and any(c.isupper() for c in s):
-                return (False, None)
+                return NAME_CLASS_REJECT
             if is_name_like_identifier_value(s):
-                return (False, None)
+                return NAME_CLASS_REJECT
             return (True, IDT.ID_ORDER_IDENTIFIER)
 
     return (False, None)
@@ -3550,8 +3584,16 @@ def process_generic_digit_prefixed_constant(s: str, stmt: str, src: str, sid: in
     append_result(res, IDT.PII_NOISE, s, src, sid)
 
 
-def process_generic_alpha_prefixed_constant(s: str, stmt: str, src: str, sid: int, res: list):
-    """处理字母开头的常量"""
+def process_generic_alpha_prefixed_constant(s: str, stmt: str, src: str, sid: int, res: list,
+                                            name_class_reject: bool = False):
+    """处理字母开头的常量。
+
+    `name_class_reject`（fix22）：该值在 `is_identifier` 里**只因命名形态排除**落选，
+    即已是「已知的名字类噪音」。本函数末尾的 CONTEXT_KEYWORDS_2 是**裸关键词出口**
+    （stmt 里出现 `cookie` / `appsecret` / `access_token` 就出口），它没有专属判据把关，
+    于是把这类名字升级进风险桶（三库实测 1 行 / 1 次：`在线建档h5需要unionId`
+    因 stmt 含 `authCookie` 被判 server_cred_cookie）。置位时改判 id_noise(2505, risk 0)。
+    """
     s_lower = s.lower()
     stmt_lower = stmt.lower()
 
@@ -3627,6 +3669,12 @@ def process_generic_alpha_prefixed_constant(s: str, stmt: str, src: str, sid: in
                 # is_single_segment_identifier_name 的注释块。
                 if is_single_segment_identifier_name(s):
                     continue
+            # fix22：只改判**这条出口本来真要产出的**标签（上面各守卫的 `continue` 一律
+            # 保持原样，否则会把「本来不产出任何类型」的值也变成 id_noise —— 实测那会多改
+            # 47 行，超出本轮授权）。
+            if name_class_reject:
+                append_result(res, IDT.ID_NOISE, s, src, sid)
+                return
             append_result(res, slug_id, s, src, sid)
             return
 
@@ -4423,15 +4471,28 @@ def perform_constant_classifying(statements: List[str], constants: List):
         if is_id:
             process_identifier(s, stmt, src, sid, id_slug, res)
             continue
+        # fix22：`is_identifier` 用 id_slug == IDT.ID_NOISE 回报「只因命名形态排除落选」——
+        # 这批值是**已知的名字类噪音**（见 NAME_CLASS_REJECT 的注释）。它们本身不需要
+        # 任何标签，但继续往下走会被凭证判据按「值自证」接手，从而把 risk 2~3 升到 risk 5
+        # （fix21 ③④ 收严后三库实测 14 行 / 17 次）。所以：**只在下面的凭证判据真要把它
+        # 当凭证时**改判 id_noise(2505, risk 0)；其余情形一律保持原行为 —— 真 uid/openid/
+        # 订单号、真 URL/路径/密钥都走各自判据，本闸门碰不到它们（量化见报告）。
+        name_class_reject = (id_slug == IDT.ID_NOISE)
 
         # 云服务密码
         if is_cloud_password(s, stmt):
-            process_cloud_password(s, stmt, src, sid, res)
+            if name_class_reject:
+                append_result(res, IDT.ID_NOISE, s, src, sid)
+            else:
+                process_cloud_password(s, stmt, src, sid, res)
             continue
 
         # 服务器 Cookie
         if is_server_cookie(s, stmt):
-            process_server_cookie(s, stmt, src, sid, res)
+            if name_class_reject:
+                append_result(res, IDT.ID_NOISE, s, src, sid)
+            else:
+                process_server_cookie(s, stmt, src, sid, res)
             continue
 
         # 云服务 Token
@@ -4454,7 +4515,8 @@ def perform_constant_classifying(statements: List[str], constants: List):
         if s[0].isdigit():
             process_generic_digit_prefixed_constant(s, stmt, src, sid, res)
         elif s[0].isalpha():
-            process_generic_alpha_prefixed_constant(s, stmt, src, sid, res)
+            # fix22：把「已知名字类噪音」的回报传进裸关键词出口（见该函数 docstring）
+            process_generic_alpha_prefixed_constant(s, stmt, src, sid, res, name_class_reject)
         elif s[0] == ".":
             process_generic_dot_prefixed_constant(s, stmt, src, sid, res)
         elif s[0] == "/":
