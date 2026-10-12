@@ -202,6 +202,13 @@ def test_shared_window_is_not_pre_stripped():
 
     观测点：perform_constant_classifying 返回的第 4 个元素就是缓存窗口本身
     （source_snippet）。若剥值写在缓存点，这里拿到的会是被第一个常量的值剥过的文本。
+
+    fix21 ④ 口径变更（留痕）：第三个常量 `signHeaderKeys` 现在不再产出 —— 它是驼峰命名的
+    键名，原先仅因**窗口里** `H5PayTradeNo` 含 `tradeno` 子串才被判 id_order_identifier，
+    正是本轮给 order 分支补命名模式排除时要收掉的误报。窗口共享这一条不受影响：
+    剩下两条（`H5PayTradeNo`→2504、`AMAP_ORDER_OVER_TIME`→1401）仍必须各出一条，
+    且返回的 snippet 必须等于整条语句；若剥值被提到缓存点，`H5PayTradeNo` 那条会消失、
+    snippet 也会是剥过的文本，断言照样会红。
     """
     stmt = ('var a = "H5PayTradeNo"; '
             'var b = "AMAP_ORDER_OVER_TIME"; '
@@ -210,7 +217,7 @@ def test_shared_window_is_not_pre_stripped():
                  ("AMAP_ORDER_OVER_TIME", 0, "f.js"),
                  ("signHeaderKeys", 0, "f.js")]
     results = C.perform_constant_classifying([stmt], constants)
-    assert len(results) == 3, results
+    assert len(results) == 2, results
     for _slug, _content, _src, snippet in results:
         assert snippet == stmt, "共享窗口被预先剥值了: %r" % (snippet,)
 

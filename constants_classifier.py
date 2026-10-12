@@ -782,6 +782,49 @@ USER_ID_KEYWORDS = {
 }
 
 
+# AD_ID_KEYWORDS 里 adid / ad_id / gaid 三个短词必须落在「独立词或相邻驼峰段」上。
+# has_keyword_in_context 的快速路径是裸子串（`kw in stmt_lower`），于是
+#   adid → threadId / readID / uploadIdCard / mobileListAdOpen / subCategoryThreadId
+#          （pkgref 一库 30/35 个 id_ad 值就是这么进来的）
+#   gaid → orgaID = "C0B37E18…"（org/orga 账号 id，不是 GAID）
+# 都被判成 id_ad_identifier。长关键词（advertisingid / advertising_id / trackingid /
+# tracking_id）不受影响，仍走原函数。
+#   adId: / AD_ID_INTERRELATION_DETAIL / ad_id 这份写法必须保住 —— 段对 ("ad","id")
+#   正是为 `adId` 这种「两个驼峰段拼成关键词」的写法准备的。
+AD_ID_SEGMENT_KEYWORDS = {
+    "adid": ("ad", "id"),
+    "ad_id": ("ad", "id"),
+    "gaid": ("ga", "id"),
+}
+
+
+def _has_segment_or_pair(stmt: str, keyword: str) -> bool:
+    """keyword 以独立词出现，或以相邻两个驼峰段出现（adId -> ad id）。"""
+    normalized = re.sub(r"[_\-\.]", " ", stmt)
+    normalized = re.sub(r"([a-z])([A-Z])", r"\1 \2", normalized)
+    normalized = re.sub(r"[:\"']", " ", normalized)
+    tokens = re.split(r"\s+", normalized.lower())
+    if keyword in tokens:
+        return True
+    pair = AD_ID_SEGMENT_KEYWORDS[keyword]
+    return any(tokens[i] == pair[0] and tokens[i + 1] == pair[1]
+               for i in range(len(tokens) - 1))
+
+
+def has_ad_id_context(stmt: str, value: str) -> bool:
+    """AD_ID_KEYWORDS 的上下文判定（fix21 ②）：adid / ad_id / gaid 收紧为段匹配。
+
+    value 参与剥值（见 external_context）：值自身含 adId 的写法不再单独定罪，
+    与 has_user_id_context / has_cloud_password_context 同一口径。`value` 无默认值，
+    漏改调用点直接 TypeError。
+    """
+    context = external_context(stmt, value)
+    long_keywords = AD_ID_KEYWORDS - set(AD_ID_SEGMENT_KEYWORDS)
+    if has_keyword_in_context(context, long_keywords):
+        return True
+    return any(_has_segment_or_pair(context, kw) for kw in AD_ID_SEGMENT_KEYWORDS)
+
+
 def has_user_id_context(stmt: str, value: str) -> bool:
     """USER_ID_KEYWORDS 的上下文判定：uid 收紧为「独立词/驼峰段」，其余关键词不变。
 
@@ -2117,12 +2160,118 @@ def process_miniapp_appid(s: str, stmt: str, src: str, sid: int, res: list):
     append_result(res, IDT.MINIAPP_NOISE, s, src, sid)
 
 
+# =========================================================
+# fix21 ①：值形成立但不是标识值的「标识符噪音」
+# =========================================================
+# 病根：is_identifier 的两条**纯值形臂**（16 位十六进制 android16、17 位 MAC）不看语境
+# 就判 id_device_identifier，于是值形撞上就进桶。三库实测 id_device 桶 3,807 值 /
+# 47,735 次里，下面五族占 1,761 值 / 39,285 次（82.3%），语境里没有任何设备语义：
+#   支付宝 ISV appid  ^2021\d{12}$           474 值 / 25,473 次（appid_ali / isvAppId）
+#   十六进制字母表本体                        19 值 / 10,895 次（"0123456789abcdef"）
+#   组播位 MAC（含 macList 的 FF:03:00 清单）1,528 值 /  3,063 次
+#   DER 编码的 X.509 扩展 OID（1.3.6.1 弧）    10 值 /    249 次
+#   连号 / 整块重复的 16 位十六进制占位         27 值 /    984 次
+# 归置：改判 id_noise(2505, risk 0, "Identifier noise") —— 不新增类型、不丢弃（值仍可回溯），
+# 与 fix20 ④ 把编译产物改判 miniapp_noise 的做法同型。
+# 误伤体检（逐族单独跑，见 test-result/fix21/c_rules.py）：五族迁出的值里，语境含设备
+# 关键词的只有 1 个 —— 十六进制字母表自身恰好出现在某个 getDeviceId 函数体内，仍是噪音。
+# 刻意**不**做的：16 位十六进制一刀切（那是 Android ID 的合法值形）、非 FF:03:00 单 OUI 的
+# MAC 清单（PII 上无法与真设备 MAC 区分，见报告）。
+RE_ALIPAY_ISV_APPID = re.compile(r"^2021\d{12}$")
+HEX_ALPHABET_CHARS = frozenset("0123456789abcdef")
+# DER 内容字节以 1.3.6.1 开头的 OID（X.509 证书扩展弧）：2b=1.3、06=6、01=1。
+# 1.2.840.* 那一支由更早的 _is_asn1_oid_hex（2a8648 前缀）负责。
+DER_OID_HEX_PREFIXES = ("2b0601",)
+
+
+def _is_hex_alphabet_table(s: str) -> bool:
+    """16 位且字符集恰好是 {0-9a-f} 全部十六个 —— 十六进制字母表本身，不是标识值。
+
+    真 Android ID 要在 16 位上把十六个十六进制字符各用一遍，概率 16!/16^16 ≈ 1.1e-5；
+    三库命中的 19 个值全部是编解码表/示例常量（"0123456789abcdef"、"1234567890abcdef"）。
+    """
+    return len(s) == 16 and set(s.lower()) == HEX_ALPHABET_CHARS
+
+
+def _is_multicast_mac(s: str) -> bool:
+    """MAC-48 首字节最低位为 1 = 组播地址，不可能是设备（单播）硬件地址。"""
+    if not is_mac_address_format(s):
+        return False
+    return int(s[:2], 16) & 0x01 == 1
+
+
+def _is_der_oid_hex(s: str) -> bool:
+    """16 位十六进制且是 DER 编码的 X.509 扩展 OID（1.3.6.1.* 弧）。
+
+    三库命中的是 jsrsasign / wx_rsa 这类证书解析库里的 `2b06010505073001`
+    （= 1.3.6.1.5.5.7.3.1 serverAuth），语境是 getExtAuthorityInfoAccess / getHexOfV_AtObj。
+    判据只看值形：真 Android ID 落在 2b0601 前缀上的概率是 16^-6 ≈ 6e-8。
+    """
+    return len(s) == 16 and is_hex_string(s) and s.lower().startswith(DER_OID_HEX_PREFIXES)
+
+
+def _is_repeated_block(s: str) -> bool:
+    """值由整块重复拼成（12345678|12345678、1234|1234|1234|1234）。"""
+    for n in (2, 3, 4, 8):
+        if len(s) % n == 0 and s == s[:len(s) // n] * n:
+            return True
+    return False
+
+
+def _is_sequential_hex_placeholder(s: str) -> bool:
+    """16 位十六进制，且数字部分是步进链（相邻 ±1，9→0 视作 +1）或整块重复。
+
+    命中的是 `1234567890123456` / `8765432112345678` / `1234567812345678` 这类密钥/IV/
+    示例占位（aesPassword、enc.Utf8.parse），不是 Android ID。真 Android ID 是 64 位随机值，
+    连成一条步进链的概率可忽略（实测三库 27 个值全部是占位形态）。
+    """
+    if len(s) != 16 or not is_hex_string(s):
+        return False
+    if _is_repeated_block(s):
+        return True
+    if not s.isdigit():
+        return False
+    for i in range(len(s) - 1):
+        a, b = int(s[i]), int(s[i + 1])
+        if not (abs(a - b) in (0, 1) or (b - a) % 10 == 1 or (a - b) % 10 == 1):
+            return False
+    return True
+
+
+def is_identifier_shaped_noise(s: str) -> bool:
+    """「值形成立但不是标识值」的五族噪音（见上方注释与量化的族规模）。"""
+    return (RE_ALIPAY_ISV_APPID.match(s) is not None
+            or _is_hex_alphabet_table(s)
+            or _is_multicast_mac(s)
+            or _is_der_oid_hex(s)
+            or _is_sequential_hex_placeholder(s))
+
+
+def is_name_like_identifier_value(s: str) -> bool:
+    """值形像「名字/文案」而不是「标识值」（fix21 ③④）。
+
+    两族：
+      含非 ASCII —— 中文文案、单据提示（`沪ICP备2023016466号`、`未传入订单orderid`、
+        `服务提交orderid与requestid校验失败`）；
+      全字母 —— 常量名/状态名/存储键/回调名（`PASSPORT`、`PROCESSING`、
+        `GetUserPhoneNumBerState`、`delivererPhone`、`qianzhudenlgu`）。
+    编号类标识值（uid/openid/unionid、订单号）都带数字，故不受影响；已带数字的常量名
+    （`SESSIONTOKENA1` 这类）由调用点既有的驼峰排除处理。
+    """
+    return (not s.isascii()) or s.isalpha()
+
+
 def is_identifier(s: str, stmt: str) -> tuple:
     """检测是否为标识符，返回 (是否匹配, 分类ID)"""
     s_len = len(s)
 
     if is_placeholder_value(s) or _is_asn1_oid_hex(s):
         return (False, None)
+
+    # fix21 ①：值形成立但不是标识值的「标识符噪音」—— 改判 id_noise(2505, risk 0)，
+    # 拦在两条纯值形臂（android16 / mac17）之前，否则值形撞上就进 id_device。
+    if is_identifier_shaped_noise(s):
+        return (True, IDT.ID_NOISE)
 
     # 纯格式匹配
     if is_valid_imei(s) or is_android_id_format(s) or is_mac_address_format(s):
@@ -2134,7 +2283,7 @@ def is_identifier(s: str, stmt: str) -> tuple:
     if is_uuid_format(s):
         if has_keyword_in_context(stmt, DEVICE_ID_KEYWORDS):
             return (True, IDT.ID_DEVICE_IDENTIFIER)
-        if has_keyword_in_context(stmt, AD_ID_KEYWORDS):
+        if has_ad_id_context(stmt, s):
             return (True, IDT.ID_AD_IDENTIFIER)
         if has_user_id_context(stmt, s):
             return (True, IDT.ID_USER_IDENTIFIER)
@@ -2146,7 +2295,7 @@ def is_identifier(s: str, stmt: str) -> tuple:
         if s_len in VALID_DEVICE_ID_LENGTHS and s.isalnum():
             return (True, IDT.ID_DEVICE_IDENTIFIER)
 
-    if has_keyword_in_context(stmt, AD_ID_KEYWORDS):
+    if has_ad_id_context(stmt, s):
         if s_len in VALID_DEVICE_ID_LENGTHS and s.isalnum():
             return (True, IDT.ID_AD_IDENTIFIER)
 
@@ -2158,10 +2307,20 @@ def is_identifier(s: str, stmt: str) -> tuple:
             # 排除驼峰命名模式（如 pageMyPhoneAuth, liveBindPhone）
             if s[0].islower() and any(c.isupper() for c in s):
                 return (False, None)
+            # fix21 ③：排除「名字/文案」形态（中文串、全字母的常量名与状态名）
+            if is_name_like_identifier_value(s):
+                return (False, None)
             return (True, IDT.ID_USER_IDENTIFIER)
 
     if has_keyword_in_context(stmt, ORDER_ID_KEYWORDS):
         if check_length_range(s, 12, 64) and (s.isdigit() or s.isalnum()):
+            # fix21 ④：order 分支原先一条命名模式排除都没有，与 id_user 分支同口径补齐
+            if s.islower() and s.isalpha():
+                return (False, None)
+            if s[0].islower() and any(c.isupper() for c in s):
+                return (False, None)
+            if is_name_like_identifier_value(s):
+                return (False, None)
             return (True, IDT.ID_ORDER_IDENTIFIER)
 
     return (False, None)
