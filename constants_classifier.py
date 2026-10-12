@@ -1417,6 +1417,11 @@ def has_bucket_blacklist_word_in_head(s: str) -> bool:
     return has_keyword_substring(s.split("-", 1)[0], BUCKET_VALUE_BLACKLIST)
 
 
+# 无分隔符、数字夹在字母中间（jscode2session / code2session / utf8decode）。
+# 只在 is_bucket_name 里用于否决桶名，见该函数内的说明。
+NO_SEPARATOR_IDENTIFIER_RE = re.compile(r'^[a-z]+\d+[a-z]+$')
+
+
 def is_bucket_name(s: str, stmt: str) -> bool:
     """检测是否为云存储桶名称"""
     if not has_keyword_substring(stmt, BUCKET_CONTEXT_WORDS):
@@ -1437,6 +1442,15 @@ def is_bucket_name(s: str, stmt: str) -> bool:
 
     # 区域形态的值是区域名，不是桶名（让位给更具体的区域判定）
     if is_cloud_region_value(s):
+        return False
+
+    # fix19 ③：无分隔符且数字**夹在字母中间**的形态是代码标识符被拍平的结果，不是桶名。
+    # 桶名要全局唯一，因此绝大多数带数字的桶名是「品牌-用途-<appid>」或「品牌<尾号数字>」
+    # （本仓三库实例：tc-buck-1254728086 / mt100180 / vias2019），把数字夹在字母中间且
+    # 全程没有 '-' 的值读起来是 `jscode2session` / `code2session` / `utf8decode` 这类
+    # **驼峰标识符**（三库实测：该形态在 149 个 cloud_bucket_name 去重值里只命中 1 个，
+    # 就是噪音值 jscode2session，真桶名 0 误伤；见 fix19 报告）。
+    if NO_SEPARATOR_IDENTIFIER_RE.match(s):
         return False
 
     # 结构复杂度: 必须包含 '-' 或数字
@@ -3202,6 +3216,27 @@ def process_generic_digit_prefixed_constant(s: str, stmt: str, src: str, sid: in
                     # APP_SECRET/SESSION_KEY/PASSWORD 不在此判定：它们已分别由更早的
                     # is_secret_key(L2135)/is_session_key(L2185)/is_cloud_password(L2202)
                     # 覆盖，而那些检查对同一 (s, stmt) 结果确定，此处再判恒为 False。
+                    continue
+            # 云区域（fix19 ①）：语境词 region 只说明「这句话在配云区域」，值本身还得真是
+            # 区域名。本链只处理**数字开头**的值，而区域名一律以 cn-/ap-/us-/eu-/na- 这类
+            # 字母前缀开头，所以数字开头的值一律过不了与主链同一条 is_cloud_region_value。
+            # 补这条守卫前，任何「stmt 里含 region 子串」的数字开头值都直接出口：
+            #   region: [101,200] / 201~500        → 价格区间（三库 18 个值，均含 ~）
+            #   regionId:10006378 / 420100000000  → 纯数字 ID（22 个值）
+            #   1,72,2839,0 / 500b1953-8,xxx-7    → CSV（3 个值）
+            #   0x1f1e6 / 20240425-address_add / 2handleSelectFloor /
+            #   2中心点坐标currentRegion / 82D9….js / 0;overflow-y:auto;… → 逐个见报告
+            # 三库合计 55/101 值（54%）是这一类噪音，46 个真区域 0 误伤。
+            elif slug_id == IDT.CLOUD_REGION:
+                if not is_cloud_region_value(s):
+                    continue
+            # 云桶名（fix19 ②）：同理，值必须过主链同一条 is_bucket_name。桶名允许数字开头，
+            # 但它的字符集是 ^[a-z0-9][a-z0-9-]*[a-z0-9]$（不含 `.` `_` `:`），长度 6~63。
+            # 补这条守卫前，`concat(v.ossBucket,"9f01….png")` 里的**文件名**（normsib 25 个，
+            # 占该库桶名 23%）和 `timeBucket: ["8:00-12:00"]` 里的**时间段**都判成了桶名，
+            # 而 is_bucket_name 本身对这两个值返回 False —— 它们根本没走主链那条判据。
+            elif slug_id == IDT.CLOUD_BUCKET_NAME:
+                if not is_bucket_name(s, stmt):
                     continue
             append_result(res, slug_id, s, src, sid)
             return
