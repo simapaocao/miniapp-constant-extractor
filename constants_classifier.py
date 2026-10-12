@@ -580,6 +580,36 @@ ELLIPTIC_CURVE_KEYWORDS = (
     "gred", "prime:", "type:", "basis:", "lambda:", "beta:",
 )
 
+# =========================================================
+# process_Regex_crypto_key 的**语境证据**（fix17）
+# =========================================================
+# 病根：这条路径原先只有两个**排除**分支（椭圆曲线预计算点表、曲线关键词）+ 一个私钥
+# 关键词分支，**没有「要语境」的闸门**：
+#     if 私钥语境: -> crypto_private_key(2102, risk5)
+#     else:        -> crypto_public_key(2103, risk2)      ← 无任何证据也判
+# 三库回放（test-result/fix17/，口径：值×source_snippet，出现次数=SUM(ref_count+1)）：
+# 该路径接住 1,379 值 / 40,738 次，其中 48/64 位 hex 有 44,923 条 pair 的语句里
+# **一个 public/private 类词都没有**（v2 库：476 值里 393 个、2,084 次里 1,763 次），
+# 典型值是曲线常量（SM2 n/Gx/Gy/b、secp256k1 Gx/Gy、ed25519 基点 y、P-192/P-256 的
+# p/n/b）与 `s = new r("FFFFFFFE…", 16)` / `g: [...]` 这类**语句就是值本身**的赋值。
+#
+# 形态分档的依据：`04`+128 位是**未压缩点编码**（ECDSA/SM2 公钥的合法前缀形态），
+# 三库 152 个该形态的值里 46 个的语句没有任何关键词，但逐个看过都是真公钥
+# （`export.PUBLICKEY=…` / `certPublicKey:…` / `M?"04659827…":"04727940…"` 开发/生产
+# 双密钥选择）；48/64 位 hex 则只是 24/32 字节，曲线常量、摘要、AES salt、随机数都同形，
+# 三库 48 位那 14 个值里真公钥 0 个。所以：**强形态照旧，弱形态要证据**。
+RE_UNCOMPRESSED_PUBKEY = re.compile(r"^04[0-9a-f]{128}$", re.I)
+
+# 证据词分两档：3 字母的 pub/priv 走「独立词或驼峰段」匹配（裸子串会命中
+# publish*/publication/isPublished/ecpubhex/privilege*/deprive，把曲线常量重新放回来——
+# 三库实测 SM2 n 靠字符串表里的 "ecpubhex"、P-256 n 靠 ASN.1 名字表里的
+# "subjectPublicKeyRSA_hN" 各开一次闸，合计 544 次出现）；复合词与长词无歧义，保持子串语义
+# （pubkey/privkey 尤其不能丢：`pubKey:` 已是段匹配，但全小写 `pubkey=` 只有这条能认）。
+CRYPTO_PUBLIC_KEY_EVIDENCE_WORDS = ("public", "pubkey", "publickey")
+CRYPTO_PRIVATE_KEY_EVIDENCE_WORDS = (
+    "private", "privatekey", "privkey", "secret", "secretkey",
+)
+
 RSA_PUBLIC_KEY_CONTEXT_WORDS = (
     "setpublic", "setpublickey", "set_public", "set_public_key",
     "publickey", "public_key", "rsapublic", "rsa_public",
@@ -1032,8 +1062,33 @@ def process_rsa_hex_public_key(s: str, stmt: str, src: str, sid: int, res: list)
     append_result(res, IDT.CRYPTO_PUBLIC_KEY, s, src, sid)
 
 
+def crypto_key_evidence(stmt: str) -> Tuple[bool, bool]:
+    """返回本路径的语境证据 (is_private, is_public)。
+
+    pub / priv 这两个 3 字母词只走「独立词或驼峰段」匹配（has_keyword_in_context_strict）；
+    复合词与长词保持子串语义，与改动前逐位一致。理由与三库实测见上面
+    CRYPTO_PUBLIC_KEY_EVIDENCE_WORDS 那段注释。
+    """
+    stmt_lower = stmt.lower()
+    is_private = (has_keyword_substring(stmt_lower, CRYPTO_PRIVATE_KEY_EVIDENCE_WORDS)
+                  or has_keyword_in_context_strict(stmt, "priv"))
+    is_public = (has_keyword_substring(stmt_lower, CRYPTO_PUBLIC_KEY_EVIDENCE_WORDS)
+                 or has_keyword_in_context_strict(stmt, "pub"))
+    return is_private, is_public
+
+
 def process_Regex_crypto_key(s: str, stmt: str, src: str, sid: int, res: list, raw_stmt: str = None):
-    """处理通过正则匹配到的加密密钥（SM2公钥等）"""
+    """处理通过正则匹配到的加密密钥（SM2公钥等）。
+
+    出三条出口：
+        私钥语境（且无公钥语境） -> crypto_private_key(2102)
+        公钥语境                -> crypto_public_key(2103)
+        `04`+128 位未压缩点形态 -> crypto_public_key(2103)（形态本身即强证据）
+    其余（48/64 位 hex 且无语境）**不出口**，回落到通用分流 —— 与 process_hex_token
+    去掉兜底后的口径一致（见 fix15 ①）。48/64 位 hex 只是 24/32 字节，曲线常量、摘要、
+    salt、随机数全是这个形态，三库实测这批里真公钥 0 个（依据见 RE_UNCOMPRESSED_PUBKEY
+    上方的注释）。
+    """
     check_stmt = raw_stmt if raw_stmt else stmt
     ctx_lower = check_stmt.lower()
 
@@ -1046,10 +1101,9 @@ def process_Regex_crypto_key(s: str, stmt: str, src: str, sid: int, res: list, r
         return
 
     # 上下文关键字判断是公钥还是私钥
-    private_keywords = ("private", "priv", "secret", "secretkey", "privatekey")
-    public_keywords = ("public", "pub", "publickey")
-    is_private = has_keyword_substring(ctx_lower, private_keywords)
-    is_public = has_keyword_substring(ctx_lower, public_keywords)
+    is_private, is_public = crypto_key_evidence(check_stmt)
+    if not (is_private or is_public) and not RE_UNCOMPRESSED_PUBKEY.match(s):
+        return
 
     slug = IDT.CRYPTO_PRIVATE_KEY if is_private and not is_public else IDT.CRYPTO_PUBLIC_KEY
     append_result(res, slug, s, src, sid)
