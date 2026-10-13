@@ -3348,29 +3348,73 @@ RE_MINIAPP_PAGE_ROUTE = re.compile(r"/pages/|^/package|^/subpackage|^/subpages",
 RE_COMPILER_IDENTITY_CONTEXT = re.compile(
     r"__wxappcode__|__wxappcurrentfile__|__wxappfile__", re.I)
 
+# fix23（收严 fix20 ④）：标记必须**直接引用该值**，而不是「窗口里恰好出现了标记」。
+#
+# fix20 ④ 原来的判据是 `RE_COMPILER_IDENTITY_CONTEXT.search(stmt) and 值以 .wxml/.wxss/.json 结尾`
+# —— 它读的是**窗口**（perform_constant_classifying 里 `stmt` = `extract_context(raw_stmt, 该语句第一个常量, 512)`，
+# 同一语句的其它常量复用这个窗口，窗口里可能根本没有该值）。于是「同一语句里恰好有个
+# __wxAppCode__，而本值只是这条语句里另一个位置的 .json/.wxml 串」也会被整条搬走。
+#
+# 真扫 icp（unlist_icp_filing_v2，代码 625ea27）实测：1907 里带 .wxml/.wxss/.json 的值
+# 122,357 个，其中「标记直接引用该值」的 121,071 个、只有「窗口里有标记」而标记**没有**
+# 引用该值的 1,286 个 / 10,771 次（test-result/fix23/c_direct.out）。这 1,286 个就是本条
+# 收掉的部分，它取的是 fix20 ③ 的取证逻辑：**被移动的值必须能在自己的 snippet 里被标记点名**。
+#
+# 形态（先读真扫 source_snippet 再定，不凭空写；样例见 test-result/fix23/c_direct.out）：
+#   `__wxAppCode__['pages/index/index.json'] = {…}`          ← 注册表键，值在引号里
+#   `__wxAppCode__[ "pages/x/y.wxml" ] = [$gwx_XC_10, …]`     ← 引号可为 ' 或 "，中括号内可有空白
+#   `__wxAppCurrentFile__ = 'pages/x/y.wxss'` / `__wxAppFile__ = '…'`  ← 当前文件标记
+# 反例（不算直接引用，留在原桶）：
+#   `__wxAppCode__['cms/auth.wxss'] = setCssToHead([[2,"./@titan/style.wxss"],]…)`
+#       —— 值是 **setCssToHead 的 @import 目标**，标记点的名是 `cms/auth.wxss`，不是 `./@titan/style.wxss`
+#   `__wxAppCode__['plugin-private://wx…/plugin.wxml'] = [$gwx, './plugin.wxml']`
+#       —— 值是注册数组的第 2 个元素，标记点的名是 plugin-private://… 那个
+RE_COMPILER_IDENTITY_REF = re.compile(
+    r"__wxappcode__\s*\[\s*(?P<q1>['\"])(?P<k1>[^'\"]*)(?P=q1)\s*\]"
+    r"|__wxapp(?:currentfile|file)__\s*=\s*(?P<q2>['\"])(?P<k2>[^'\"]*)(?P=q2)",
+    re.I)
+
 # fix20 ④：这些后缀在编译产物里是**模板/样式/配置**文件身份，两边读法（字面 require 路径 /
 # 宽义的「前端模块引用」）下都不是模块引用：
 #   `pages/account/reserve.json` ← `__wxAppCode__['pages/account/reserve.json'] = {…}`
 #   `pages/account/login/index.wxml` / `.wxss` ← 编译模板/样式（setCssToHead、__wxAppCurrentFile__）
-# 三库实测：1906 里「全部 snippet 都是编译器身份语境」的值 = icp 34,063 / pkgref 31,143 /
-# normsib 51,092（占桶 55.6%/49.8%/50.6%），其中 .wxml/.json/.wxss 合计约 79%
-# （.wxml 31%/30%/31%、.json 31%/29%/29%、.wxss 18%/18%/18%）；出现次数口径见
-# test-result/fix20/issue4_pure.out。
 # **故意不包含 .js**：`__wxAppCode__['pages/x/index.js'] = function(){…}` 里的值就是编译后
 # 模块的模块 id（同族里还有 343/786/2510 个值的同语境里直接出现 require/import），
 # 按字面与宽义都可能算「模块路径」，证据不足以移走 —— 这一条是本处刻意留下的残余（见报告）。
+# 真扫 icp 复验（code 625ea27）：1907 里 .js 为 0 个值，这条边界守住了。
 MINIAPP_COMPILER_NONMODULE_EXTENSIONS = (".wxml", ".wxss", ".json")
+
+
+def _norm_compiler_ref_path(p: str) -> str:
+    """编译器身份串里的路径归一：反斜杠→斜杠，剥掉前导 `./`。
+
+    真扫里同一个文件两种写法同时出现（`pages/index/index.wxml` 与 `./pages/index/index.wxml`
+    是同一份模板的第 1、2 个注册位），所以两侧都按这个归一后比较。
+    """
+    p = (p or "").replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p
 
 
 def is_compiler_file_identity(s: str, stmt: str) -> bool:
     """值是否为「编译器身份串里的非模块文件」——模板/样式/配置文件身份。
 
-    判据 = 语境里出现编译器身份标记 + 值以 .wxml/.wxss/.json 结尾。
-    归置见 perform_constant_classifying 的调用点：miniapp_noise(1907)。
+    判据 = ① 语境里出现编译器身份标记；② 值以 .wxml/.wxss/.json 结尾；
+           ③ **标记直接引用该值**（值本身在标记的引号里，见 RE_COMPILER_IDENTITY_REF）。
+    归置见 perform_constant_classifying 的**链尾改判**：把本来会产出的标签换成
+    miniapp_noise(1907)，**不制造新行**（口径见那里的注释）。
     """
     if not RE_COMPILER_IDENTITY_CONTEXT.search(stmt or ""):
         return False
-    return s.lower().endswith(MINIAPP_COMPILER_NONMODULE_EXTENSIONS)
+    if not s.lower().endswith(MINIAPP_COMPILER_NONMODULE_EXTENSIONS):
+        return False
+    want = _norm_compiler_ref_path(s)
+    for m in RE_COMPILER_IDENTITY_REF.finditer(stmt):
+        key = m.group("k1") if m.group("k1") is not None else m.group("k2")
+        if _norm_compiler_ref_path(key) == want:
+            return True
+    return False
 
 
 def has_usingcomponents_context(stmt: str) -> bool:
@@ -4204,7 +4248,21 @@ def perform_constant_classifying(statements: List[str], constants: List):
     processed_indices = set()
     truncated_contexts = {}
 
+    # fix23：链尾「改判」要按**源常量**判（不是按写入值判）。
+    #   原因：有几个处理器写进库的不是源常量本身 —— `process_prefixed_miniapp_plugin`
+    #   写的是剥掉 `plugin-private://` 的 rel_path、`process_miniapp_appid` 等也各有形态；
+    #   用写入值反查 `is_compiler_file_identity` 会漏掉它们（真扫 icp 实测漏 1,684 值，
+    #   它们会从 1907 掉回 1903）。所以按迭代区间记账：某条常量产出的结果全部 append 完
+    #   之后，把它的标记写到这些结果的序号上。收尾时机放在**下一次迭代的开头**与循环之后，
+    #   这样函数体里那几十个 `continue` 一个都不用改。
+    ci_flags = {}          # res 序号 -> (是否编译器身份串, 该常量的源值)
+    ci_pending = None      # (起始序号, 标记, 源值)
+
     for i, (s, sid, src) in enumerate(constants):
+        if ci_pending is not None:
+            for _k in range(ci_pending[0], len(res)):
+                ci_flags[_k] = (ci_pending[1], ci_pending[2])
+            ci_pending = None
         if i in processed_indices:
             continue
         assert sid < len(statements) and len(s) >= 4
@@ -4213,6 +4271,12 @@ def perform_constant_classifying(statements: List[str], constants: List):
         if sid not in truncated_contexts:
             truncated_contexts[sid] = extract_context(raw_stmt, s, 512)
         stmt = truncated_contexts[sid]
+
+        # 便宜的短路在前：绝大多数常量不带这三个后缀，不必进正则
+        ci_pending = (len(res),
+                      s.lower().endswith(MINIAPP_COMPILER_NONMODULE_EXTENSIONS)
+                      and is_compiler_file_identity(s, stmt),
+                      s)
 
         consumed = False
         s_lower = s.lower()
@@ -4281,16 +4345,10 @@ def perform_constant_classifying(statements: List[str], constants: List):
             continue
 
         # =========================================================
-        # 编译器身份串里的模板/样式/配置文件身份（fix20 ④）—— 结构性拦截
+        # 编译器身份串里的模板/样式/配置文件身份（fix20 ④ / fix23）
         # =========================================================
-        # 与上面几处「编译产物」拦截同一族，但归置不同：这里**不丢弃**，改判
-        # miniapp_noise(1907，"Miniapp internal noise"，risk 0) —— 值本身形态完好
-        # （是小程序的文件路径），保留便于回溯文件清单，只是它不是业务常量、
-        # 更不是模块引用。判据与量化见 is_compiler_file_identity 的注释。
-        # `.js` 身份（编译模块 id）刻意留在原处（1906），理由同注释。
-        if is_compiler_file_identity(s, stmt):
-            append_result(res, IDT.MINIAPP_NOISE, s, src, sid)
-            continue
+        # 不在链首拦截，改到**链尾改判**（见函数末尾的 final_res 循环）。原因见那里的注释。
+        # 判据与量化见 is_compiler_file_identity 的注释。
 
         # =========================================================
         # 高频类型优先检测
@@ -4524,14 +4582,64 @@ def perform_constant_classifying(statements: List[str], constants: List):
         else:
             process_generic_unknown_constant(s, stmt, src, sid, res)
 
+    # 收尾最后一条常量的改判标记（见循环开头的说明）
+    if ci_pending is not None:
+        for _k in range(ci_pending[0], len(res)):
+            ci_flags[_k] = (ci_pending[1], ci_pending[2])
+
     # 替换 sid 为截断上下文
     final_res = []
-    for (slug_id, content, src, sid) in res:
+    for _ri, (slug_id, content, src, sid) in enumerate(res):
         if sid in truncated_contexts:
             truncated_ctx = truncated_contexts[sid]
         else:
             stmt = statements[sid] if sid < len(statements) else ""
             truncated_ctx = extract_context(stmt, content, 512)
+        # =========================================================
+        # fix20 ④ / fix23：编译器身份串里的模板/样式/配置文件身份 —— **链尾改判**
+        # =========================================================
+        # 这里**不丢弃**，改判 miniapp_noise(1907, "Miniapp internal noise", risk 0)
+        # —— 值本身形态完好（是小程序的文件路径），保留便于回溯文件清单，只是它不是
+        # 业务常量、更不是模块引用。`.js` 身份（编译模块 id）刻意留在原处（1906）。
+        #
+        # ⚠️ 口径（fix23 修的就是这一条，下一轮重扫必须按这里核对）：
+        #   fix20 ④ 的**测量口径**是「1906 桶里多少个值会流出去」（icp 27,148 值 / 149,072 次），
+        #   而它的**实现口径**当初是分类链**最前面**的一处拦截 —— 命中即产出 1907 并 `continue`，
+        #   于是它的真实后果远大于测量：真扫 icp（code 625ea27）进 1907 的带后缀值是 122,357 个
+        #   / 1,182,122 次，**4.5 倍**。差额的 90,628 值 / 976,846 次根本不是「从一个桶搬到另一个桶」
+        #   —— 按 2f7fd0d（fix20 ④ 之前的真扫代码）回放，它们**本来不产出任何标签（丢弃）**，
+        #   是链首拦截把它们**无中生有**地写成了 risk-0 行（归因见 test-result/fix23/b2_attrib_real.out）。
+        #   实测的族谱（icp 真扫语料回放，2f7fd0d 下的原去向）：
+        #       miniapp_path_module(1906)         29,053 值 / 165,878 次   ← 测量到的就是这一族
+        #       miniapp_plugin_url(1903)           1,716 值 /  11,362 次
+        #       miniapp_page_path_sensitive(1901)    702 值 /   2,362 次
+        #       other(9901)                          258 值 /  25,674 次
+        #       本来无产出（丢弃）                90,628 值 / 976,846 次   ← 无中生有的那 90k
+        #   改成链尾改判后：**只把本来会产出的值换标签，不再制造新行**。这就是本处的用词
+        #   「改判」的字面含义，也与 writer 侧的既有事实一致（.js 身份另有一族 —— 见上）。
+        #
+        # 为什么改判**不限** 1906、而覆盖所有出口（1906/1903/1901/other）：
+        #   fix20 ④ 当初的链首拦截对**所有**出口一视同仁（命中即 `continue`，后面判据全不跑），
+        #   所以「这条 .wxml 不是模块引用而是编译产物里的文件身份」这个**判断**对 1903/1901 同样成立。
+        #   若把改判收窄成「只改 1906」，真扫 icp 会有 2,421 值 / 13,745 次**退回 risk 2~3 桶**
+        #   （plugin-private://…/x.wxml → miniapp_plugin_url、pages/test/test.wxml →
+        #   miniapp_page_path_sensitive），那是把 risk 桶的噪音加回去，与既有红线
+        #   「不许有新噪音进 risk>0 桶」冲突。所以本轮只砍「无中生有」，不动出口集合。
+        #
+        # 口径一致性（fix23 的关键）：改判用的窗口 `truncated_ctx` **就是** writer 存进
+        #   `source_snippet` 的那个字符串（本函数末尾把 sid 换成它再交给 writer），
+        #   而判据读的 `ci_flags` 来自**源常量**（见循环开头的记账说明）—— 所以
+        #   「实现看到的语境」与「量化回放看到的语境」逐字相同，回放可以当成真扫的预测。
+        #
+        # 写回**源常量**而不是链的产出值：与同族出口一致（`process_miniapp_appid` 与
+        #   fix20 ④ 原先的链首拦截写的都是源常量 `s`）。不这样做的话，凡是链上会把值变形的
+        #   处理器（`process_prefixed_miniapp_plugin` 写的是剥掉 `plugin-private://` 的
+        #   rel_path）都会**顺带改掉库里存的值** —— 真扫 icp 实测那会多动 1,661 行的内容，
+        #   而本轮只想砍掉「无中生有」的这一件事。
+        _ci = ci_flags.get(_ri)
+        if _ci and _ci[0]:
+            slug_id = IDT.MINIAPP_NOISE
+            content = _ci[1]
         final_res.append((slug_id, content, src, truncated_ctx))
 
     return final_res

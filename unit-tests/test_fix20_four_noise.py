@@ -20,7 +20,29 @@
 ④ `miniapp_path_module`(1906) 里 `__wxAppCode__['pages/x/y.wxml']` 这类编译器文件身份
    （.wxml/.wxss/.json）改判 miniapp_noise(1907, risk0)；`.js` 身份刻意不动。
 
-期望值均由 test-result/fix20/ 下的回放脚本对着真分类器跑出后写死。
+fix23（④ 的直接延续，口径修正）
+-------------------------------------------------------------------------------
+fix20 ④ 的**测量口径**是「1906 桶里多少个值会流出去」（icp 27,148 值 / 149,072 次），
+而它的**实现口径**当初是分类链**最前面**的一处拦截 —— 命中即产出 1907 并 `continue`。
+真扫 icp（code 625ea27）实测进 1907 的带后缀值是 122,357 个 / 1,182,122 次，**4.5 倍**。
+按 2f7fd0d（fix20 ④ 之前的真扫代码）回放这 122,357 个值，原去向是：
+    miniapp_path_module(1906)         29,053 值 / 165,878 次   ← 测量到的只有这一族
+    miniapp_plugin_url(1903)           1,716 值 /  11,362 次
+    miniapp_page_path_sensitive(1901)    702 值 /   2,362 次
+    other(9901)                          258 值 /  25,674 次
+    本来无产出（丢弃）                90,628 值 / 976,846 次   ← 无中生有写进 risk0 的那批
+（归因见 test-result/fix23/b2_attrib_real.out，全局前后对照见 e_global.out）
+
+fix23 的两处修正：
+  (甲) 判据收严：标记必须**直接点名该值**（`__wxAppCode__['<值>']` /
+       `__wxAppCurrentFile__ = '<值>'`），不再是「窗口里恰好出现标记」。
+       真扫 icp 上这会收掉 1,286 值 / 10,771 次「窗口有标记但没点名本值」的搬迁。
+  (乙) 归置从链首拦截改成**链尾改判**：只把本来会产出的标签换成 1907，**不新造行** ——
+       与它自己的用词「改判」一致，也与同段其它结构性拦截（全部丢弃、从不 emit）一致。
+       真扫 icp 上行级后果：消失 92,253 行（其中 90,569 行是上述「本来无产出」的幻影行）、
+       新增 1,685 行（1,684 个是 plugin 分支本来就会写的形态 + 1 个 (甲) 收严后新吐出的 1906）。
+
+期望值均由 test-result/fix20/、test-result/fix23/ 下的回放脚本对着真分类器跑出后写死。
 用法: .venv/bin/python -X utf8 unit-tests/test_fix20_four_noise.py
 """
 import os
@@ -277,6 +299,90 @@ def test_compiler_identity_does_not_touch_api_json_paths():
     v = "/api/cms/articles/views.json?"
     got = classify(v, 'url: "/api/cms/articles/views.json?"')
     check("④ 接口 .json? 不进 1907", NOISE not in got, f"got={got}")
+
+
+# ---------------------------------------------------------
+# fix23 (甲)：判据必须是「标记点名了本值」，不是「窗口里恰好有标记」
+# ---------------------------------------------------------
+def test_fix23_requires_direct_reference():
+    """三个真实反例（真扫 icp 语料）：标记在窗口里，但点名的不是本值 → 判据不成立。"""
+    cases = [
+        # setCssToHead 的 @import 目标：标记点名的是 cms/auth.wxss
+        ("./@titan/style.wxss",
+         "__wxAppCode__['cms/auth.wxss'] = setCssToHead([[2,\"./@titan/style.wxss\"],],undefined,{path:\"./cms/auth.wxss\"})"),
+        # 注册数组的第 2 个元素：标记点名的是 plugin-private://… 那一个
+        ("./plugin.wxml",
+         "global.__wxAppCode__['plugin-private://wx9ad912bf20548d92/plugin.wxml'] = "
+         "[$gwx_wx9ad912bf20548d92, './plugin.wxml' ]"),
+        # 同语句其它常量的窗口复用：标记点名的是 reserve.json
+        ("pages/other/index.json", "__wxAppCode__['pages/account/reserve.json']={}"),
+    ]
+    for v, stmt in cases:
+        ctx = C.extract_context(stmt, v, 512)
+        check(f"④(甲) 标记没点名本值 → 判据不成立: {v}",
+              not C.is_compiler_file_identity(v, ctx))
+        check(f"④(甲) 且该值不进 1907: {v}", NOISE not in classify(v, stmt),
+              f"got={classify(v, stmt)}")
+
+
+def test_fix23_direct_reference_surface_forms():
+    """判据的形态边界：引号 ' / "、中括号内空白、`./` 前导（两侧归一后比较）。"""
+    pos = [("pages/x/y.json", "__wxAppCode__['pages/x/y.json'] = {}"),
+           ("pages/x/y.json", '__wxAppCode__[ "pages/x/y.json" ] = {}'),
+           ("pages/x/y.json", "__wxAppCode__[  'pages/x/y.json'  ] = {}"),
+           ("pages/x/y.wxml", "__wxAppCurrentFile__ = 'pages/x/y.wxml'"),
+           ("pages/x/y.wxss", '__wxAppFile__="pages/x/y.wxss"'),
+           # 键不带 ./、值带 ./ 是同一个文件（真扫里两种写法都出现）
+           ("./pages/x/y.json", "__wxAppCode__['pages/x/y.json'] = {}")]
+    for v, stmt in pos:
+        check(f"④(甲) 点名成立: {v} @ {stmt[:34]}",
+              C.is_compiler_file_identity(v, stmt))
+    neg = [("pages/x/y.json", "__wxAppCode__['pages/x/z.json'] = {}"),
+           ("pages/x/y.json", "x = '__wxAppCode__'"),
+           ("pages/x/y.json", "__wxAppCode__['./pages/x/z.json'] = {}"),
+           ("pages/x/y.js", "__wxAppCode__['pages/x/y.js'] = function(){}")]
+    for v, stmt in neg:
+        check(f"④(甲) 不成立: {v} @ {stmt[:34]}",
+              not C.is_compiler_file_identity(v, stmt))
+
+
+# ---------------------------------------------------------
+# fix23 (乙)：本判据是「改判」不是「新增」—— 本来无产出的值必须仍无产出
+# ---------------------------------------------------------
+def test_fix23_relabel_not_emit():
+    """真扫 icp 上 fix20 ④ 无中生有写了 90,569 个 risk0 行；这些值本来就该无产出。
+
+    反例都是**判据成立**（标记点名了本值）但**本值本来没有出口**的：
+      · 裸文件名 / `miniprogram_npm/…`：第 4 步以外没有出口
+      · `./` 相对路径：本分类器对 `./`/`../`/`/./` 一律不出口（设计如此）
+    它们现在必须仍然是「无产出」，而不是被写成 1907。
+    """
+    cases = [("project.config.json", "__wxAppCode__['project.config.json'] ="),
+             ("app.json", "__wxAppCode__['app.json'] ="),
+             ("miniprogram_npm/weui-miniprogram/icon/icon.json",
+              "__wxAppCode__['miniprogram_npm/weui-miniprogram/icon/icon.json'] = {\"component\":true}"),
+             ("./pages/index/index.wxml",
+              "__wxAppCode__['pages/index/index.wxml'] = [$gwx_XC_10, './pages/index/index.wxml']")]
+    for v, stmt in cases:
+        ctx = C.extract_context(stmt, v, 512)
+        check(f"④(乙) 判据仍点名该值: {v}", C.is_compiler_file_identity(v, ctx))
+        got = classify(v, stmt)
+        check(f"④(乙) 本来无产出 → 仍无产出（不新造 risk0 行）: {v}", not got, f"got={got}")
+
+
+def test_fix23_relabel_keeps_real_outlets():
+    """本来有出口的值仍然被改判（改判口径 = 换标签，不改出口集合）。"""
+    cases = [("pages/index/index.wxml",
+              "__wxAppCode__['pages/index/index.wxml'] = [$gwx_XC_10, './pages/index/index.wxml']"),
+             ("pages/account/reserve.json", "__wxAppCode__['pages/account/reserve.json']={}"),
+             # plugin 分支本来就会产出（且写的是剥掉前缀的 rel_path）—— 改判后仍是 1907
+             ("plugin-private://wx069ba97219f66d99/components/list/list.wxml",
+              "__wxAppCode__['plugin-private://wx069ba97219f66d99/components/list/list.wxml'] = "
+              "$gwx_wx069ba97219f66d99( './components/list/list.wxml' )")]
+    for v, stmt in cases:
+        got = classify(v, stmt)
+        check(f"④(乙) 本来有出口 → 改判 1907: {v}", NOISE in got, f"got={got}")
+        check(f"④(乙) 且不再产出原标签: {v}", MODULE not in got, f"got={got}")
 
 
 # =========================================================
