@@ -259,13 +259,34 @@ def test_apikey_statement_not_public_key():
 def test_known_residual_pbkdf2_test_vector():
     """PBKDF2 测试向量：语句里的**测试输入串** `PBKDF2("password", …)` 会开
     cloud_cred_password(5) 的闸。三库 3 个值 / 9 条 pair，改动前是 crypto_public_key(2)
-    —— 两种口径都错，本轮不处理（值形守卫会撞 fix12 的「hex 口令」红线）。
+    —— 两种口径都错。
 
-    这条断言是**现状记录**而非期望：一旦将来有人修掉它，这里会红，提示更新报告。
+    沿革：这条**曾**是「现状记录」而非期望（fix17 不处理，值形守卫会撞 fix12 的「hex
+    口令」红线）。fix42 的 P5 族（KDF 测试向量：hex 摘要 + 同一调用里的 KDF 调用与盐
+    字面量）已把它修掉，断言随之改成**回归断言** —— 落点逐位钉死，一动就红：
+      · 不再判 cloud_cred_password；
+      · 落点是**空**（无产出），不许悄悄漂到 crypto_public_key / server_cred_token
+        或任何别的桶；
+      · 也不许漂进任何 risk_level >= 4 的桶。
     """
     vec = "cdedb5281bb2f801565a1122b25635150ad1f7a04bb9f3a333ecc0e2e1f70837"
     stmt = 'X.strictEqual(a.PBKDF2("password", "ATHENA.MIT.EDUraeburn", 32), "%s")' % vec
-    assert _classify(vec, stmt) == [CCP], _classify(vec, stmt)
+    got = _classify(vec, stmt)
+    assert CCP not in got, got
+    assert got == [], got
+    _id_to_slug = {v: k for k, v in vars(IDT).items()
+                   if isinstance(v, int) and k.isupper() and not k.startswith("CTG_")}
+    import json
+    with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "constant_types.json"), encoding="utf-8") as fh:
+        tax = json.load(fh)
+    risk = {}
+    for cat in tax.get("datatype_categories", []):
+        for it in cat.get("items", []):
+            risk[it["slug"].upper()] = it.get("risk", cat.get("default_risk"))
+    bad = [(lbl, _id_to_slug.get(lbl), risk.get(_id_to_slug.get(lbl, "")))
+           for lbl in got if (risk.get(_id_to_slug.get(lbl, "")) or 0) >= 4]
+    assert not bad, bad
 
 
 def _run_standalone():

@@ -48,7 +48,7 @@ OTHER = IDT.OTHER
 
 
 def _classify(v, stmt, path_rule_off=False, cookie_rule_off=False, naive_cookie=False,
-              url_rule_off=False):
+              url_rule_off=False, fix31_off=False):
     """跑一遍分类；各 Off 开关都只关掉一条判据，其余逐位不变。"""
     saved = []
     if path_rule_off:
@@ -57,6 +57,11 @@ def _classify(v, stmt, path_rule_off=False, cookie_rule_off=False, naive_cookie=
     if url_rule_off:
         saved.append(("is_url_query_or_css_fragment", C.is_url_query_or_css_fragment))
         C.is_url_query_or_css_fragment = lambda s: False
+    if fix31_off:
+        # fix31 的 1203 三族结构守卫（`&password=` 这种「URL 片段值形」在 fix16 之后
+        # 又被它拦了一道）—— 要看到 fix16 之前/之后的落点就得连它一起关掉。
+        saved.append(("is_cloud_password_noise", C.is_cloud_password_noise))
+        C.is_cloud_password_noise = lambda s, st_: False
     if cookie_rule_off:
         saved.append(("_is_cookie_name_without_value", C._is_cookie_name_without_value))
         C._is_cookie_name_without_value = lambda s, k: False
@@ -112,14 +117,17 @@ def test_path_password_matrix_dropped():
 def test_grant_type_password_in_url_is_not_context():
     """URL 里的 `grant_type=password`（OAuth grant 名）不再是密码语境。
 
-    值本身由 fix13 的 URL 查询片段拦截丢掉，所以这里同时关掉那一条才能看到落点：
-    关掉 URL 拦截后，①生效 -> other；①也关掉 -> 回到 cloud_cred_password(5)。
+    值本身由 fix13 的 URL 查询片段拦截丢掉；fix31 的 1203 三族守卫又补了一层
+    （`&password=` 是「值形即 URL 片段」那一族）。所以这里要按开关顺序看落点：
+    都不关 -> 丢；关掉 URL 拦截 -> other；再关掉 fix31 -> 回到 cloud_cred_password(5)。
     """
     stmt = ("var u = e.default.host + '/oauth/token?grant_type=password&username='"
             " + a + '&password=' + d;")
     assert _classify("&password=", stmt) == []
     assert _classify("&password=", stmt, url_rule_off=True) == [OTHER]
-    assert _classify("&password=", stmt, url_rule_off=True, path_rule_off=True) == [CCP]
+    assert _classify("&password=", stmt, url_rule_off=True, path_rule_off=True) == [OTHER]
+    assert _classify("&password=", stmt, url_rule_off=True, path_rule_off=True,
+                     fix31_off=True) == [CCP]
 
 
 def test_assign_and_keyname_forms_still_context():

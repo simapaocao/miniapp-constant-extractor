@@ -214,9 +214,14 @@ def test_end_to_end_legit_unaffected():
          'url:"https://restapi.amap.com/v3/geocode/regeo?output=JSON&location="'
          '.concat(o,",").concat(l,"&key=97b588d3e3e852c4acbe118886022078")',
          [IDT.OTHER]),
+        # fix37 改了**这个 PII 值自己的标签**（与本轮 URL/CSS 拦截无关）：这条值里
+        # `@` 前面是 `&emsp;&emsp;电子邮箱：id` —— 含 `&`/`;`/中文/全角冒号，整串不是
+        # 邮箱，正是 fix37 要改判的那一族（「客户服务电子邮箱：xxx@…」/「联系方式：
+        # xxx@…」，v2 2303 桶里 309 值 / 555 链接）。所以期望值从 pii_email_name(3)
+        # 改成 pii_noise(2304, risk 0)；本条真正钉住的「拦截器前后标签一致」不变。
         ("&emsp;&emsp;电子邮箱：id@189.cn",
          "Z([3,'\\x26emsp;\\x26emsp;电子邮箱：id@189.cn'])",
-         [IDT.PII_EMAIL_NAME]),
+         [IDT.PII_NOISE]),
         ("/login-module/auth/login", 'url: "/login-module/auth/login"',
          [IDT.SERVER_URL_AUTH]),
         ("^1.2.3", 'dependencies: {"lib": "^1.2.3"}', [IDT.OTHER]),
