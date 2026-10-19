@@ -205,10 +205,15 @@ def test_shared_window_is_not_pre_stripped():
 
     fix21 ④ 口径变更（留痕）：第三个常量 `signHeaderKeys` 现在不再产出 —— 它是驼峰命名的
     键名，原先仅因**窗口里** `H5PayTradeNo` 含 `tradeno` 子串才被判 id_order_identifier，
-    正是本轮给 order 分支补命名模式排除时要收掉的误报。窗口共享这一条不受影响：
-    剩下两条（`H5PayTradeNo`→2504、`AMAP_ORDER_OVER_TIME`→1401）仍必须各出一条，
-    且返回的 snippet 必须等于整条语句；若剥值被提到缓存点，`H5PayTradeNo` 那条会消失、
-    snippet 也会是剥过的文本，断言照样会红。
+    正是本轮给 order 分支补命名模式排除时要收掉的误报。
+
+    fix26 口径变更（留痕）：第二个常量 `AMAP_ORDER_OVER_TIME` 也不再产出 —— 它是多段 snake
+    常量名，原先仅因**窗口里**（其实是值自身）出现 `amap` 子串而被地图 Key 的通用语境支判
+    saas_map_key(1401)，正是 fix26 给该支补标识符名守卫时要收掉的噪音
+    （真库形态：`AMAP_ORDER_OVER_TIME: "AMAP_ORDER_OVER_TIME"`，自赋值 i18n key）。
+
+    窗口共享这一条不受影响：剩下一条（`H5PayTradeNo`→2504）必须仍产出，且返回的 snippet 必须
+    等于整条语句；若剥值被提到缓存点，这条也会消失、snippet 也会是剥过的文本，断言照样会红。
     """
     stmt = ('var a = "H5PayTradeNo"; '
             'var b = "AMAP_ORDER_OVER_TIME"; '
@@ -217,7 +222,7 @@ def test_shared_window_is_not_pre_stripped():
                  ("AMAP_ORDER_OVER_TIME", 0, "f.js"),
                  ("signHeaderKeys", 0, "f.js")]
     results = C.perform_constant_classifying([stmt], constants)
-    assert len(results) == 2, results
+    assert len(results) == 1, results
     for _slug, _content, _src, snippet in results:
         assert snippet == stmt, "共享窗口被预先剥值了: %r" % (snippet,)
 

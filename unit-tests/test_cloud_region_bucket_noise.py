@@ -78,6 +78,12 @@ def _strip_fix19(src):
         i = src.index(start)
         j = src.index(end, i) + len(end)
         src = src[:i] + src[j:]
+    # fix35 之后，「改动前」模块还要把 fix35 的桶名证据判据一并关掉 —— 否则 counterfactual
+    # 落到的是「fix19 未生效 + fix35 生效」，`test_jscode2session_not_bucket` 里那条
+    # 「改动前会判桶名」的断言就不再成立（fix35 把无绑定的桶形值改判 id_noise(2505)）。
+    fix35_pred = ("    return looks_like_bucket_name(s, stmt) and has_bucket_name_evidence(s, stmt)")
+    assert src.count(fix35_pred) == 1, "fix35 判据标记不唯一"
+    src = src.replace(fix35_pred, "    return looks_like_bucket_name(s, stmt)")
     return src
 
 
@@ -266,18 +272,23 @@ def test_jscode2session_not_bucket():
 
 
 def test_true_buckets_still_bucket():
-    """三库真桶名全部保留（含数字开头 / 纯 hex 无后缀）—— 0 误伤。"""
+    """三库真桶名全部保留（含数字开头 / 绑在桶键上的纯 hex）—— 0 误伤。
+
+    fix35 之后这条断言加了前提：**值必须绑在桶键上**（或自身是 COS 形态
+    `<name>-<10 位 appid>`）。原先 9 个样本里有 4 个靠「窗口裸子串 + 值形」进来，
+    它们的键并非紧邻在值左侧（三目/`||` 表达式、值是对象字面量的键、值在另一个键下），
+    fix35 把它们改判 id_noise(2505, risk0) —— 见下面的 MOVE_BY_FIX35 组。
+    """
     cases = [
         ("tc-buck-1254728086", 'bucket: "tc-buck-1254728086"'),
         ("scedu-1259336801", 'Bucket: "scedu-1259336801"'),
-        ("eqxiu-video", 'videoBucket: i > 0 ? "eqxiu-video" : "eqxiu-test"'),
-        ("mt100180", 'e.BUCKET_NAME = r.IS_STANDALONE_DEPLOY ? n : "mt100180"'),
         ("qsc-images", 'ossBucket:"qsc-images"'),
-        ("a-seatbucket", 'value: "a-seatbucket", ossBucket: v'),
-        ("005c1f64a45c44ddb05959d6f2350d57", 'ucOssBucket:"005c1f64a45c44ddb05959d6f2350d57"'),
         # 数字开头的真桶名（is_bucket_name 本来就收，守卫不许把它们一起拒掉）
         ("1234567890-images", 'bucket: "1234567890-images"'),
         ("1254728086-buck", 'ucOssBucket:"1254728086-buck"'),
+        # COS 形态豁免绑定（值在 `||` 表达式的尾部）
+        ("avatar-1302652390",
+         'avatorBucket:"release"===v.b? "avatar-1302652390" : "avatar-1253822818"'),
     ]
     for v, sn in cases:
         assert C.is_bucket_name(v, sn) is True, v
@@ -285,9 +296,37 @@ def test_true_buckets_still_bucket():
         assert BUCKET in got, (v, got)
 
 
+# fix35 起**刻意移出**的 4 个样本：(值, 语句, 键，说明)。它们都是「看着像真桶名但键没绑上」，
+# 归置 = id_noise(2505, risk0)，见 unit-tests/test_fix35_bucket_binding.py 与 test-result/fix35/。
+BUCKET_MOVED_BY_FIX35 = [
+    ("eqxiu-video", 'videoBucket: i > 0 ? "eqxiu-video" : "eqxiu-test"', "三目表达式"),
+    ("mt100180", 'e.BUCKET_NAME = r.IS_STANDALONE_DEPLOY ? n : "mt100180"', "三目表达式"),
+    ("a-seatbucket", 'value: "a-seatbucket", ossBucket: v', "值是另一个键的值"),
+    # 32 位 hex：fix35 按任务要求**硬否决**（坐在桶键上也不是桶名）
+    ("005c1f64a45c44ddb05959d6f2350d57", 'ucOssBucket:"005c1f64a45c44ddb05959d6f2350d57"',
+     "32 位 hex 硬否决"),
+]
+
+
+def test_fix35_narrows_true_bucket_set_to_bound_values():
+    """fix35 后：键没紧邻绑在值上的桶形值不再判桶名，改判 id_noise(2505, risk0)。"""
+    assert IDT.ID_NOISE == 2505
+    for v, sn, note in BUCKET_MOVED_BY_FIX35:
+        assert C.is_bucket_name(v, sn) is False, (v, note)
+        got = _slugs(v, sn)
+        assert got == [IDT.ID_NOISE], (v, note, got)
+        # 改动前（fix19 未生效 + fix35 未生效）这些值判的是桶名
+        assert BUCKET in _slugs(v, sn, guards_on=False), (v, note)
+
+
 def test_bucket_guard_is_shape_not_prefix():
-    """守卫按**值形**判定，不按首字符：数字开头不构成拒绝理由。"""
-    assert C.is_bucket_name("1234567890-images", 'bucket: "x"') is True
+    """守卫按**值形**判定，不按首字符：数字开头不构成拒绝理由。
+
+    fix35 起语句里必须带上该值（绑定证据只能在**值自己的窗口**里看）：原来这条用的是
+    `'bucket: "x"'`（窗口里没有该值），fix35 之后那种情况下拿不到绑定 → 不判桶名。
+    """
+    assert C.is_bucket_name("1234567890-images", 'bucket: "1234567890-images"') is True
+    assert C.is_bucket_name("1234567890-images", 'ossBucket: "1234567890-images"') is True
     assert C.is_bucket_name("9f015ec44db54c19a6bb9e47e9527ad7.png", SN_PNG) is False
     assert C.is_bucket_name("8:00-12:00", SN_TIME) is False
 

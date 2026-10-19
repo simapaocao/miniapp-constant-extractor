@@ -52,17 +52,26 @@ def classify(v, stmt):
 
 def classify_before(v, stmt):
     """把 fix21 ①②③ 的新判据还原成改动前（④ 的驼峰/小写排除是内联的，见各用例的
-    「改动前会命中」前置断言）。"""
+    「改动前会命中」前置断言）。
+
+    fix44 注：本助手要复现的是**改动前的代码**。fix44 在 ad 臂里又加了一道值形守卫
+    （is_ad_identifier_name_like），它比 fix21 ② 更晚生效；只还原 fix21 的三条判据会得到
+    一个**从未存在过的中间状态**（pre-fix21 的语境口径 + post-fix44 的值形守卫），
+    于是 `uploadIdCard` / `uploadIDCard` 这类全字母值不再落 id_ad，「改动前确实在 id_ad」
+    的前置断言会假失败。所以这里把 fix44 的守卫一并关断 —— 只影响本助手，不影响任何用例
+    对**当前代码**的断言。
+    """
     saved = (C.is_identifier_shaped_noise, C.has_ad_id_context,
-             C.is_name_like_identifier_value)
+             C.is_name_like_identifier_value, C.is_ad_identifier_name_like)
     C.is_identifier_shaped_noise = lambda s: False
     C.has_ad_id_context = lambda stmt, value: C.has_keyword_in_context(stmt, C.AD_ID_KEYWORDS)
     C.is_name_like_identifier_value = lambda s: False
+    C.is_ad_identifier_name_like = lambda s: False
     try:
         return classify(v, stmt)
     finally:
         (C.is_identifier_shaped_noise, C.has_ad_id_context,
-         C.is_name_like_identifier_value) = saved
+         C.is_name_like_identifier_value, C.is_ad_identifier_name_like) = saved
 
 
 RESULTS = []
@@ -174,7 +183,12 @@ def test_2_ad_true_positives_survive():
                      'exports.AD_ID_INTERRELATION_DETAIL = "0f1ed79601abd56e8b25ad41fc0610c5"'),
                     ("2bba17fe7a6797f8720cecbf39158de9",
                      'exports.AD_ID_CALENDAR_DETAIL_HORE = "2bba17fe7a6797f8720cecbf39158de9"'),
-                    ("374320oTXsZf", '_0x3ffc8b = [ "setting", "2081184QzxuBX", "ad_id", "%s" ]' % "374320oTXsZf")):
+                    # 本条要钉的是「独立串 token "ad_id" 能开广告语境闸门」，与值的形状无关。
+                    # 原用的值（6 位数字 + 6 位字母）正是 fix44 判读为 webpack 混淆串表 token
+                    # 的那一形态（见 test-result/fix44/），fix44 已把它在广告语境里收成
+                    # id_noise，故这里换成 32 位 hex，避免让本行同时钉住一个已被推翻的形状。
+                    ("93c1e0f4a7b25d6819fe30ac47bd5210",
+                     '_0x3ffc8b = [ "setting", "2081184QzxuBX", "ad_id", "%s" ]' % "93c1e0f4a7b25d6819fe30ac47bd5210")):
         got = classify(v, stmt)
         check(f"② 真 adId 证据仍在 id_ad: {v[:28]}", AD in got, f"got={got}")
     for stmt in ('adId: "x"', 'AD_ID_INTERRELATION_DETAIL = "x"', '"ad_id"', 'gaId: "x"', 'adid: "x"'):
